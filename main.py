@@ -527,9 +527,9 @@ elif selected_section == "3. Indicadores y Documentación":
             df_cleaned = clean_patient_data_for_test(sample_patient_data)
             assert all(df_cleaned['edad'].dropna() >= 0), "Las edades calculadas no deben ser negativas."
             # Verificar edad para id_paciente 1 (1954-01-08) -> 2025-1954 = 71
-            assert df_cleaned.loc[df_cleaned['id_paciente'] == 1, 'edad'].iloc[0] == 71, "La edad para el paciente 1 no se calculó correctamente."
+            assert df_cleaned.loc[df_cleaned['id_paciente'] == 1, 'edad'].iloc[0] == 71, "La edad para el paciente 1 no se calculo correctamente."
             # Verificar que la fecha futura (2025-01-01) resulta en edad nula/None
-            assert pd.isna(df_cleaned.loc[df_cleaned['id_paciente'] == 3, 'edad'].iloc[0]), "La edad para fecha futura debería ser nula."
+            assert pd.isna(df_cleaned.loc[df_cleaned['id_paciente'] == 3, 'edad'].iloc[0]), "La edad para fecha futura deberia ser nula."
             # Verificar que si fecha_nacimiento es nulo pero la edad existe, se mantiene (id_paciente 5)
             assert df_cleaned.loc[df_cleaned['id_paciente'] == 5, 'edad'].iloc[0] == 30, "La edad para el paciente 5 no se mantuvo correctamente."
 
@@ -538,15 +538,15 @@ elif selected_section == "3. Indicadores y Documentación":
             df_cleaned = clean_patient_data_for_test(sample_patient_data) # No hay limpieza directa de email, solo validación
             invalid_emails_in_cleaned = df_cleaned[~df_cleaned['email'].astype(str).str.match(r'[^@]+@[^@]+\.[^@]+', na=False)]
             # Esperamos que 'pedro@example' siga siendo inválido
-            assert 'pedro@example' in invalid_emails_in_cleaned['email'].values, "El email 'pedro@example' no se marcó como inválido."
-            # No esperamos que se añadan nuevos inválidos, y su número debe ser consistente con los originales
-            assert len(invalid_emails_in_cleaned) == 1, "Se detectó un número inesperado de correos electrónicos inválidos."
+            assert 'pedro@example' in invalid_emails_in_cleaned['email'].values, "El email 'pedro@example' no se marco como invalido."
+            # No esperamos que se añadan nuevos invalidos, y su numero debe ser consistente con los originales
+            assert len(invalid_emails_in_cleaned) == 1, "Se detecto un numero inesperado de correos electronicos invalidos."
 
 
         def test_telefono_numeric_after_cleaning(sample_patient_data):
             df_cleaned = clean_patient_data_for_test(sample_patient_data)
-            assert all(df_cleaned['telefono'].dropna().apply(lambda x: x.isdigit())), "El campo teléfono contiene caracteres no numéricos después de la limpieza."
-            assert pd.isna(df_cleaned.loc[df_cleaned['id_paciente'] == 2, 'telefono'].iloc[0]), "El teléfono con caracteres no numéricos no se limpió correctamente."
+            assert all(df_cleaned['telefono'].dropna().apply(lambda x: x.isdigit())), "El campo telefono contiene caracteres no numericos despues de la limpieza."
+            assert pd.isna(df_cleaned.loc[df_cleaned['id_paciente'] == 2, 'telefono'].iloc[0]), "El telefono con caracteres no numericos no se limpio correctamente."
         ```
         Para ejecutar Pytest, necesitas:
         1.  `pytest` instalado: `pip install pytest`
@@ -700,6 +700,13 @@ elif selected_section == "4. EDA Avanzado & Dashboards":
             st.markdown("#### Edad Promedio por Ciudad y Género")
             if not df_display[['ciudad', 'sexo', 'edad']].dropna().empty:
                 avg_age_city_sex = df_display.groupby(['ciudad', 'sexo'])['edad'].mean().unstack()
+                
+                # --- FIX: Ensure numerical type and replace any non-numeric with NaN ---
+                # Convert the DataFrame to float type, coercing any non-numeric to NaN
+                # Then fill any explicit None or NA with np.nan for heatmap compatibility
+                avg_age_city_sex = avg_age_city_sex.astype(float).fillna(np.nan)
+                # --- END FIX ---
+
                 fig_avg_age, ax_avg_age = plt.subplots(figsize=(12, 7))
                 sns.heatmap(avg_age_city_sex, annot=True, fmt=".1f", cmap="YlGnBu", linewidths=.5, ax=ax_avg_age)
                 ax_avg_age.set_title('Edad Promedio por Ciudad y Género')
