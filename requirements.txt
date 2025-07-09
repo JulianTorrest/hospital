@@ -6,4 +6,4 @@ seaborn
 pyarrow
 numpy
 scikit-learn
-yellowbrick
+yellowbrick==1.6
