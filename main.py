@@ -200,7 +200,7 @@ df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping).fillna(None) # Usar .ma
             'm': 'Male',
             'male': 'Male'
         }
-        df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping).fillna(None) # Mapea y convierte no mapeados a None
+        df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping).fillna(value=None) # Mapea y convierte no mapeados a None
         
         st.write("Valores de `sexo` después de la normalización y mapeo:")
         st.write(df_cleaned['sexo'].value_counts(dropna=False))
