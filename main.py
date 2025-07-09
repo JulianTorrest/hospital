@@ -4,7 +4,7 @@ import requests
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime, date
-import numpy as np
+import numpy as np # Importar numpy para np.nan
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 
@@ -183,14 +183,17 @@ elif selected_section == "2. Limpieza y Validación":
 # Convertir a cadena y a minúsculas para un manejo consistente
 df_cleaned['sexo'] = df_cleaned['sexo'].astype(str).str.lower()
 
-# Mapear valores a 'Female', 'Male' o None
+# Mapear valores a 'Female', 'Male' o np.nan para no mapeados
 sex_mapping = {
     'f': 'Female',
     'female': 'Female',
     'm': 'Male',
     'male': 'Male'
 }
-df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping).fillna(None) # Usar .map() y .fillna(None) para no mapeados
+df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping) # Esto generará np.nan para valores no mapeados
+
+# Finalmente, reemplazar np.nan con None (Python None)
+df_cleaned.loc[df_cleaned['sexo'].isna(), 'sexo'] = None
 """)
         # Aplicar la lógica de limpieza y mapeo
         df_cleaned['sexo'] = df_cleaned['sexo'].astype(str).str.lower()
@@ -200,12 +203,15 @@ df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping).fillna(None) # Usar .ma
             'm': 'Male',
             'male': 'Male'
         }
-        df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping).fillna(value=None) # Mapea y convierte no mapeados a None
+        df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping) # Genera np.nan para no mapeados
         
+        # Rellenar np.nan (si los hay) con Python None
+        df_cleaned.loc[df_cleaned['sexo'].isna(), 'sexo'] = None
+
         st.write("Valores de `sexo` después de la normalización y mapeo:")
         st.write(df_cleaned['sexo'].value_counts(dropna=False))
         st.markdown("""
-        **Justificación:** Los valores de la columna `sexo` se normalizan a minúsculas y luego se mapean explícitamente a `'Female'` o `'Male'`. Cualquier valor que no coincida con estas categorías mapeadas (incluyendo cadenas vacías, 'nan', o 'Other') se convierte a `None` (nulo), asegurando una consistencia total para análisis y filtros.
+        **Justificación:** Los valores de la columna `sexo` se normalizan a minúsculas y luego se mapean explícitamente a `'Female'` o `'Male'`. Cualquier valor que no coincida con estas categorías mapeadas (incluyendo cadenas vacías, 'nan', o 'Other') se convierte a `None` (nulo), asegurando una consistencia total para análisis y filtros. Se utiliza `numpy.nan` para el manejo intermedio de nulos, que es la forma estándar de Pandas.
         """)
 
         st.markdown("#### Limpieza y Cálculo de `fecha_nacimiento` y `edad`")
@@ -386,6 +392,13 @@ elif selected_section == "3. Indicadores y Documentación":
         **Observación:** Aunque la limpieza no los altera, se validó su formato. Este indicador muestra si persisten correos con formato no estándar.
         """)
 
+        st.write("**`telefono` - Contiene solo dígitos (después de la limpieza):**")
+        non_numeric_phones_cleaned = df_cleaned[df_cleaned['telefono'].notna() & ~df_cleaned['telefono'].astype(str).str.isdigit()]
+        if not non_numeric_phones_cleaned.empty:
+            st.warning(f"Se encontraron **{len(non_numeric_phones_cleaned)}** registros con **números de teléfono que contienen caracteres no numéricos** después de la limpieza (esto no debería ocurrir si la limpieza fue efectiva).")
+        else:
+            st.success("Todos los teléfonos contienen solo dígitos o son nulos después de la limpieza.")
+
         st.subheader("3.2. Documentación del Proceso")
 
         st.markdown("### **Supuestos Adoptados Durante la Limpieza:**")
@@ -483,7 +496,9 @@ elif selected_section == "3. Indicadores y Documentación":
                 'm': 'Male',
                 'male': 'Male'
             }
-            df_cleaned_test['sexo'] = df_cleaned_test['sexo'].map(sex_mapping).fillna(None)
+            df_cleaned_test['sexo'] = df_cleaned_test['sexo'].map(sex_mapping)
+            df_cleaned_test.loc[df_cleaned_test['sexo'].isna(), 'sexo'] = None
+
 
             # Fecha Nacimiento y Edad
             df_cleaned_test['fecha_nacimiento'] = pd.to_datetime(df_cleaned_test['fecha_nacimiento'], errors='coerce')
@@ -614,9 +629,15 @@ elif selected_section == "4. EDA Avanzado & Dashboards":
             df_display = df_display[df_display['ciudad'] == selected_city_filter]
 
         # Filtro por sexo
-        all_sex = ['Todos'] + sorted(df_display['sexo'].dropna().unique().tolist())
+        # Asegurarse de que 'None' aparezca como una opción si hay nulos
+        unique_sexes = df_display['sexo'].dropna().unique().tolist()
+        if df_display['sexo'].isnull().any():
+            unique_sexes.append('No especificado') # Añadir una opción para nulos
+        all_sex = ['Todos'] + sorted(unique_sexes)
         selected_sex_filter = col2.selectbox("Filtrar por Sexo:", all_sex)
-        if selected_sex_filter != 'Todos':
+        if selected_sex_filter == 'No especificado':
+            df_display = df_display[df_display['sexo'].isnull()]
+        elif selected_sex_filter != 'Todos':
             df_display = df_display[df_display['sexo'] == selected_sex_filter]
 
         # Filtro por rango de edad
@@ -787,7 +808,7 @@ elif selected_section == "5. Modelado de Machine Learning":
             ax_cluster_counts.set_ylabel('Conteo de Pacientes')
             st.pyplot(fig_cluster_counts)
             st.dataframe(cluster_counts.to_frame(name='Conteo'))
-            st.markdown("Este gráfico muestra cuántos pacientes fueron asignados a cada cluster.")
+            st.markdown("Este gráfico de barras apiladas muestra cuántos pacientes fueron asignados a cada cluster.")
 
             # Visualización de los clusters (si solo tenemos una característica como 'edad')
             st.markdown("#### Visualización de Clusters (Distribución de Edad por Cluster)")
