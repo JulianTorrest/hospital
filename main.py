@@ -196,7 +196,7 @@ if selected_section == "1. Exploración Inicial":
 
         1.  **Valores Nulos:** Principalmente en la columna `edad`.
         2.  **Inconsistencias de Formato:**
-            * `sexo`: Posibles variaciones en la capitalización (`Female` vs `female`), o abreviaciones (`F` vs `M`).
+            * `sexo`: Posibles variaciones en la capitalización (`Female` vs `female`), o abreviaciones (`F` vs `f`).
             * `fecha_nacimiento`: Necesita conversión a tipo `datetime` y manejo de posibles formatos incorrectos.
             * `edad`: Debe ser un valor numérico y consistente con `fecha_nacimiento`. Si es `null`, debe ser calculado.
             * `email`, `telefono`: Requieren validación de formato (aunque el ejemplo dado parece limpio, es buena práctica).
@@ -886,7 +886,7 @@ elif selected_section == "3. Indicadores y Documentación":
                 </html>
                 """.format(
                     date_generated=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    nulos_df_html=st.session_state['df_nulos_comp'].to_html(index=True),
+                    nulos_df_html=st.session_state['df_nulos_comp'].to_html(index=True) if not st.session_state['df_nulos_comp'].empty else "<p>No hay datos de comparación de nulos.</p>",
                     original_types=str(indicators_original.get('Tipos de Datos por Columna', {})),
                     cleaned_types=str(indicators_cleaned.get('Tipos de Datos por Columna', {})),
                     sex_original_unique=str(df_original['sexo'].value_counts(dropna=False).index.tolist()),
@@ -896,10 +896,10 @@ elif selected_section == "3. Indicadores y Documentación":
                     total_patients=kpis.get('num_patients', 'N/A'),
                     avg_age=kpis.get('avg_age', np.nan) if pd.notna(kpis.get('avg_age', np.nan)) else 'N/A',
                     most_common_city=kpis.get('most_common_city', 'N/A'),
-                    eda_plots_html="".join([f'<div class="plot-container"><h4>{title}</h4><img src="data:image/png;base64,{img_data}" /></div>' for title, img_data in eda_plots]),
-                    cluster_centers_html=cluster_results['cluster_centers_df'].to_html(index=True) if not cluster_results['cluster_centers_df'].empty else "<p>No hay datos de centros de cluster.</p>",
-                    cluster_counts_html=cluster_results['cluster_counts_df'].to_html(index=True) if not cluster_results['cluster_counts_df'].empty else "<p>No hay datos de conteo por cluster.</p>",
-                    cluster_plots_html="".join([f'<div class="plot-container"><h4>{title}</h4><img src="data:image/png;base64,{img_data}" /></div>' for title, img_data in cluster_results['cluster_plots_data']]),
+                    eda_plots_html="".join([f'<div class="plot-container"><h4>{title}</h4><img src="data:image/png;base64,{img_data}" /></div>' for title, img_data in eda_plots]) if eda_plots else "<p>No hay visualizaciones de EDA disponibles. Ejecuta la sección 'EDA Avanzado' para generarlas.</p>",
+                    cluster_centers_html=cluster_results['cluster_centers_df'].to_html(index=True) if not cluster_results['cluster_centers_df'].empty else "<p>No hay datos de centros de cluster. Ejecuta la sección de 'Modelado ML' para generarlos.</p>",
+                    cluster_counts_html=cluster_results['cluster_counts_df'].to_html(index=True) if not cluster_results['cluster_counts_df'].empty else "<p>No hay datos de conteo por cluster. Ejecuta la sección de 'Modelado ML' para generarlos.</p>",
+                    cluster_plots_html="".join([f'<div class="plot-container"><h4>{title}</h4><img src="data:image/png;base64,{img_data}" /></div>' for title, img_data in cluster_results['cluster_plots_data']]) if cluster_results['cluster_plots_data'] else "<p>No hay visualizaciones de clusters disponibles. Ejecuta la sección de 'Modelado ML' para generarlas.</p>",
                     n_clusters_value=cluster_results.get('n_clusters', 'N/A'),
                     silhouette_score_value=cluster_results.get('silhouette_score', np.nan),
                     davies_bouldin_index_value=cluster_results.get('davies_bouldin_index', np.nan),
@@ -1334,7 +1334,7 @@ elif selected_section == "5. Modelado de Machine Learning":
         # Necesitamos el OneHotEncoder para saber los nombres de las columnas categóricas después de la transformación
         # para que StandardScaler.inverse_transform trabaje correctamente en el subconjunto numérico.
         # Una forma más robusta es obtener los nombres de las columnas transformadas:
-        ohe_feature_names = preprocessor.named_transformers_['cat'].get_feature_names_out(categorical_features).tolist()
+        ohe_feature_names = preprocessor.named_transformers_['cat'].get_feature_names_out(categorical_features).tolist() if 'cat' in preprocessor.named_transformers_ else []
         all_transformed_features = numeric_features + ohe_feature_names
 
         # Reconstruir un DataFrame para facilitar la interpretación de los centros de cluster
@@ -1342,11 +1342,11 @@ elif selected_section == "5. Modelado de Machine Learning":
         # Para interpretar los centros en la escala original, necesitamos aplicar la inversa de StandardScaler.
         # Para categóricas, no hay una 'inversa' directa, se interpreta por la proporción de 1s.
 
-        # Desescalar los centros para las características numéricas
+        cluster_df_num = pd.DataFrame() # Initialize empty DataFrame
         if numeric_features:
             scaler = preprocessor.named_transformers_['num']
             # Obtener solo las columnas numéricas de los centros
-            # Esto asume que las columnas numéricas están al principio de X_scaled_all
+            # Esto asumes que las columnas numéricas están al principio de X_scaled_all
             cluster_centers_scaled_num = kmeans.cluster_centers_[:, :len(numeric_features)]
             cluster_centers_original_num = scaler.inverse_transform(cluster_centers_scaled_num)
             cluster_df_num = pd.DataFrame(cluster_centers_original_num, columns=numeric_features)
@@ -1356,7 +1356,7 @@ elif selected_section == "5. Modelado de Machine Learning":
             st.info("No hay características numéricas seleccionadas para mostrar promedios por cluster.")
 
         # Guardar para el informe HTML
-        st.session_state['cluster_results_data']['cluster_centers_df'] = cluster_df_num if 'cluster_df_num' in locals() else pd.DataFrame()
+        st.session_state['cluster_results_data']['cluster_centers_df'] = cluster_df_num
 
 
         # Para características categóricas
