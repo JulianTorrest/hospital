@@ -1,72 +1,475 @@
 import streamlit as st
 import pandas as pd
-import requests
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime, date
 import numpy as np
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.cluster import KMeans
-from sklearn.compose import ColumnTransformer
-import io
-import base64
 import plotly.express as px
-from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+import plotly.graph_objects as go
+from datetime import date, datetime
+import re
+import base64
+import io
+from io import StringIO
 
-# --- Initial Configuration ---
-st.set_page_config(layout="wide", page_title="Análisis de Calidad de Datos Hospital")
-st.title("🏥 Análisis y Calidad de Datos de Pacientes de Hospital")
-st.markdown("Esta aplicación realiza un análisis exhaustivo de la calidad de los datos de pacientes, seguido de procesos de limpieza, validación, generación de KPIs, EDA avanzado y un modelo de Machine Learning.")
+# Para el modelo de clustering
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, davies_bouldin_index, calinski_harabasz_index
 
-# URL del archivo JSON
-DATA_URL_PACIENTES = "https://raw.githubusercontent.com/JulianTorrest/hospital/refs/heads/main/dataset_hospital%202.json"
+# --- Configuración de la página de Streamlit ---
+st.set_page_config(layout="wide", page_title="Análisis y Calidad de Datos de Pacientes", page_icon="🏥")
 
-# --- Funciones de Ayuda para Carga de Datos y Caching ---
-@st.cache_data
-def load_data(url, key_name):
-    """Carga datos desde una URL y normaliza un JSON si tiene una clave raíz."""
-    try:
-        response = requests.get(url)
-        response.raise_for_status() # Lanza un error para códigos de estado HTTP malos
-        data = response.json()
-        if key_name in data:
-            df = pd.json_normalize(data[key_name])
-        else:
-            df = pd.DataFrame(data) # Asume que es una lista de objetos directamente
-        return df
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error de red al cargar datos desde {url}: {e}")
-        return pd.DataFrame()
-    except ValueError as e:
-        st.error(f"Error al decodificar JSON desde {url}: {e}")
-        return pd.DataFrame()
-    except KeyError:
-        st.error(f"La clave '{key_name}' no se encontró en el JSON de {url}. Asegúrate de que el JSON tenga una estructura con '{key_name}'.")
-        return pd.DataFrame()
-    except Exception as e:
-        st.error(f"Ocurrió un error inesperado al procesar datos desde {url}: {e}")
-        return pd.DataFrame()
-
-# Función para calcular la edad (usada en limpieza y validación)
-def calculate_age_from_dob(row_dob, current_date):
+# --- Funciones Auxiliares ---
+def calculate_age_from_dob(row_dob, current_date=None):
     if pd.isna(row_dob):
         return None
+    
+    # Si current_date no se proporciona, usa la fecha actual
+    if current_date is None:
+        current_date = date.today()
+        
+    # Convertir a objeto date si no lo es
+    if isinstance(row_dob, pd.Timestamp):
+        row_dob = row_dob.date()
+    elif isinstance(row_dob, str):
+        try:
+            row_dob = datetime.strptime(row_dob, '%Y-%m-%d').date()
+        except ValueError:
+            return None # Si el formato de string no es válido
+    elif not isinstance(row_dob, date):
+        return None # Tipo de dato no soportado
+
+    age = current_date.year - row_dob.year - ((current_date.month, current_date.day) < (row_dob.month, row_dob.day))
+    return age if age >= 0 else None
+
+def get_missing_values_comparison(df_original, df_cleaned):
+    missing_original = df_original.isnull().sum()
+    missing_original_pct = (df_original.isnull().sum() / len(df_original)) * 100
+
+    missing_cleaned = df_cleaned.isnull().sum()
+    missing_cleaned_pct = (df_cleaned.isnull().sum() / len(df_cleaned)) * 100
+
+    df_nulos_comp = pd.DataFrame({
+        'Columna': df_original.columns,
+        'Original_Nulos': missing_original,
+        'Original_Porcentaje': missing_original_pct,
+        'Limpio_Nulos': missing_cleaned,
+        'Limpio_Porcentaje': missing_cleaned_pct
+    }).set_index('Columna')
+    return df_nulos_comp
+
+def plot_missing_values_comparison(df_nulos_comp):
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=df_nulos_comp.index,
+        y=df_nulos_comp['Original_Porcentaje'],
+        name='Original (%)',
+        marker_color='skyblue'
+    ))
+
+    fig.add_trace(go.Bar(
+        x=df_nulos_comp.index,
+        y=df_nulos_comp['Limpio_Porcentaje'],
+        name='Limpio (%)',
+        marker_color='lightcoral'
+    ))
+
+    fig.update_layout(
+        title_text='Comparación de Valores Faltantes (%) Antes y Después de la Limpieza',
+        xaxis_title='Columnas',
+        yaxis_title='Porcentaje de Nulos (%)',
+        barmode='group',
+        legend_title='Conjunto de Datos'
+    )
+    return fig
+
+def create_pie_chart(df, column, title):
+    counts = df[column].value_counts(dropna=False)
+    # Reemplazar NaN para mostrar como 'Nulo' en el gráfico
+    counts.index = counts.index.fillna('Nulo')
+    fig = px.pie(
+        names=counts.index,
+        values=counts.values,
+        title=title
+    )
+    return fig
+
+def create_histogram(df, column, title, n_bins=20):
+    fig = px.histogram(df, x=column, nbins=n_bins, title=title)
+    fig.update_layout(bargap=0.1)
+    return fig
+
+def clean_patient_data(df_raw):
+    df_cleaned = df_raw.copy()
+    
+    # 1. Limpieza y estandarización de 'sexo'
+    df_cleaned['sexo'] = df_cleaned['sexo'].astype(str).str.lower().str.strip()
+    sex_mapping = {
+        'f': 'Female',
+        'female': 'Female',
+        'm': 'Male',
+        'male': 'Male'
+    }
+    df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping)
+    # Convertir cualquier valor no mapeado (incluyendo 'nan' como string) a None
+    df_cleaned.loc[df_cleaned['sexo'].isna(), 'sexo'] = None
+
+    # 2. Limpieza y conversión de 'fecha_nacimiento' y cálculo de 'edad'
+    # Intentar convertir a datetime, los errores se convierten en NaT
+    df_cleaned['fecha_nacimiento'] = pd.to_datetime(df_cleaned['fecha_nacimiento'], errors='coerce')
+
+    # Calcular edad basada en fecha_nacimiento, manejar NaT y fechas futuras
+    # Usar una fecha fija para el cálculo en un entorno reproducible o para pruebas
+    current_date_for_age_calc = date.today()
+    df_cleaned['edad_calculada'] = df_cleaned['fecha_nacimiento'].apply(lambda dob: calculate_age_from_dob(dob, current_date_for_age_calc))
+
+    # Priorizar la edad calculada si fecha_nacimiento es válida y la edad reportada es nula/inconsistente
+    df_cleaned['edad'] = df_cleaned.apply(
+        lambda row: row['edad_calculada'] if pd.notna(row['edad_calculada']) else row['edad'], axis=1
+    )
+    # Descartar edades negativas o excesivamente altas (ej. si fecha de nacimiento es en el futuro)
+    df_cleaned.loc[(df_cleaned['edad'] < 0) | (df_cleaned['edad'] > 120), 'edad'] = None # Edad máxima razonable 120
+    
+    # Convertir 'edad' a Int64 para soportar nulos
+    df_cleaned['edad'] = df_cleaned['edad'].astype('Int64')
+    
+    # Eliminar la columna temporal 'edad_calculada'
+    df_cleaned = df_cleaned.drop(columns=['edad_calculada'])
+
+    # 3. Limpieza de 'telefono': remover no dígitos, convertir cadenas vacías a None
+    df_cleaned['telefono'] = df_cleaned['telefono'].astype(str).str.replace(r'[^0-9]', '', regex=True)
+    df_cleaned.loc[df_cleaned['telefono'].str.strip() == '', 'telefono'] = None
+
+    # 4. Validación de 'email': aunque no se "limpia" en el sentido de modificar, se puede identificar inválidos
+    # El patrón de email es para verificar estructura, no existencia
+    email_pattern = r'[^@]+@[^@]+\.[^@]+'
+    df_cleaned['email_valido'] = df_cleaned['email'].astype(str).str.match(email_pattern)
+    # Los correos inválidos no se eliminan, solo se marcan para análisis.
+    # Puedes decidir qué hacer con ellos aquí (ej. convertirlos a None, aunque la descripción dice que no se alteran).
+    # Por ahora, solo tenemos el indicador.
+
+    # 5. Validación y estandarización de 'ciudad' (ejemplo, podría necesitar un catálogo)
+    # Solo a minúsculas y sin espacios extra, pero no se mapea a un catálogo real sin datos de ejemplo.
+    df_cleaned['ciudad'] = df_cleaned['ciudad'].astype(str).str.strip().str.title()
+    # Si 'nan' como string, convertir a None
+    df_cleaned.loc[df_cleaned['ciudad'] == 'Nan', 'ciudad'] = None
+
+    return df_cleaned
+
+def get_kpis(df):
+    kpis = {}
+    
+    # KPIs generales
+    kpis['total_pacientes'] = len(df)
+    kpis['pacientes_con_email'] = df['email'].count()
+    kpis['pacientes_con_telefono'] = df['telefono'].count()
+    kpis['porcentaje_hombres'] = (df['sexo'] == 'Male').sum() / len(df) * 100 if len(df) > 0 else 0
+    kpis['porcentaje_mujeres'] = (df['sexo'] == 'Female').sum() / len(df) * 100 if len(df) > 0 else 0
+
+    # Edad
+    kpis['edad_promedio'] = df['edad'].mean()
+    kpis['edad_mediana'] = df['edad'].median()
+    kpis['edad_minima'] = df['edad'].min()
+    kpis['edad_maxima'] = df['edad'].max()
+    
+    # Otros
+    kpis['ciudades_unicas'] = df['ciudad'].nunique()
+    kpis['emails_invalidos_conteo'] = (~df['email_valido']).sum() if 'email_valido' in df.columns else 0 # Conteo de inválidos si la columna existe
+    
+    return kpis
+
+def generate_eda_plots(df):
+    plots = []
+
+    # Distribución de Edad
+    fig_edad = create_histogram(df.dropna(subset=['edad']), 'edad', 'Distribución de Edad')
+    plots.append(("Distribución de Edad", fig_edad))
+
+    # Distribución de Sexo
+    fig_sexo = create_pie_chart(df, 'sexo', 'Distribución de Sexo')
+    plots.append(("Distribución de Sexo", fig_sexo))
+
+    # Ciudades más Frecuentes (Top 10)
+    top_cities = df['ciudad'].value_counts().nlargest(10)
+    fig_ciudad = px.bar(
+        x=top_cities.index,
+        y=top_cities.values,
+        title='Top 10 Ciudades con más Pacientes',
+        labels={'x': 'Ciudad', 'y': 'Número de Pacientes'}
+    )
+    plots.append(("Top 10 Ciudades", fig_ciudad))
+
+    # Edad por Sexo (Box Plot)
+    fig_edad_sexo = px.box(df.dropna(subset=['edad', 'sexo']), x='sexo', y='edad', title='Distribución de Edad por Sexo')
+    plots.append(("Edad por Sexo", fig_edad_sexo))
+
+    return plots
+
+def generate_html_report(df_cleaned, df_original, df_nulos_comp, indicators_original, indicators_cleaned, kpis, eda_plots, cluster_results):
+    # Función para convertir Plotly figures a HTML
+    def fig_to_html(fig):
+        return fig.to_html(full_html=False, include_plotlyjs='cdn')
+
+    # Convertir plots de EDA a HTML
+    eda_plots_html = ""
+    for title, fig in eda_plots:
+        eda_plots_html += f"<h3>{title}</h3>"
+        eda_plots_html += fig_to_html(fig)
+        eda_plots_html += "<br>"
+
+    # Convertir plots de Cluster a HTML
+    cluster_plots_html = ""
+    if 'cluster_plots_data' in cluster_results and cluster_results['cluster_plots_data']:
+        for title, fig in cluster_results['cluster_plots_data']:
+            cluster_plots_html += f"<h3>{title}</h3>"
+            cluster_plots_html += fig_to_html(fig)
+            cluster_plots_html += "<br>"
     else:
-        # Asegurarse de que row_dob sea un objeto datetime, no solo una cadena
-        if isinstance(row_dob, str):
-            try:
-                row_dob = datetime.strptime(row_dob, '%Y-%m-%d').date()
-            except ValueError:
-                return None # No se pudo analizar la fecha
-        elif isinstance(row_dob, pd.Timestamp):
-            row_dob = row_dob.date()
+        cluster_plots_html += "<p>No hay gráficos de clustering disponibles o el modelo no se ha ejecutado.</p>"
 
-        # Calcular la edad
-        age = current_date.year - row_dob.year - ((current_date.month, current_date.day) < (row_dob.month, row_dob.day))
-        return age if age >= 0 else None # La edad no puede ser negativa
+    # Asegurarse de que cluster_centers_df exista y no esté vacío
+    cluster_centers_html = ""
+    if 'cluster_centers_df' in cluster_results and not cluster_results['cluster_centers_df'].empty:
+        cluster_centers_html = f"<h4>Centros de los Clusters:</h4>{cluster_results['cluster_centers_df'].to_html()}<br>"
+    else:
+        cluster_centers_html = "<p>Centros de los clusters no disponibles.</p>"
 
-# Cargar datos de pacientes
-df_pacientes = load_data(DATA_URL_PACIENTES, 'pacientes')
+    # Asegurarse de que cluster_counts_df exista y no esté vacío
+    cluster_counts_html = ""
+    if 'cluster_counts_df' in cluster_results and not cluster_results['cluster_counts_df'].empty:
+        cluster_counts_html = f"<h4>Conteo de Pacientes por Cluster:</h4>{cluster_results['cluster_counts_df'].to_html()}<br>"
+    else:
+        cluster_counts_html = "<p>Conteo de pacientes por cluster no disponible.</p>"
+        
+    # Tabla de nulos
+    nulos_comp_html = df_nulos_comp.to_html(classes="table table-striped") if not df_nulos_comp.empty else "<p>No hay datos de comparación de nulos.</p>"
+
+    # Comparación de tipos de datos
+    tipos_original = {col: str(df_original[col].dtype) for col in df_original.columns}
+    tipos_limpio = {col: str(df_cleaned[col].dtype) for col in df_cleaned.columns}
+    tipos_comp_html = f"""
+    <h4>Tipos de datos originales:</h4>
+    <pre>{tipos_original}</pre>
+    <h4>Tipos de datos después de la limpieza:</h4>
+    <pre>{tipos_limpio}</pre>
+    """
+
+    # Indicadores de Consistencia y Unicidad
+    sexo_original_unique = str(indicators_original.get('sexo_unique_original', 'N/A'))
+    sexo_limpio_unique = str(indicators_cleaned.get('sexo_unique_cleaned', 'N/A'))
+    email_invalidos_original = indicators_original.get('email_invalidos_original', 'N/A')
+    email_invalidos_limpio = indicators_cleaned.get('email_invalidos_limpio', 'N/A')
+    telefono_solo_digitos_limpio = 'Sí' if indicators_cleaned.get('telefono_only_digits_cleaned', False) else 'No'
+
+    consistency_html = f"""
+    <h3>Indicadores de Consistencia y Unicidad</h3>
+    <h4>sexo - Unicidad de Categorías:</h4>
+    <p>Original: {sexo_original_unique}</p>
+    <p>Limpio: {sexo_limpio_unique}</p>
+    <p>Observación: Se espera que el número de categorías únicas y sus nombres se normalicen después de la limpieza (ej., solo 'Female', 'Male' y None).</p>
+    <h4>email - Patrón de Formato (Conteo de Inválidos):</h4>
+    <p>Correos inválidos (Original): {email_invalidos_original}</p>
+    <p>Correos inválidos (Limpio): {email_invalidos_limpio}</p>
+    <p>Observación: Aunque la limpieza no los altera, se validó su formato. Este indicador muestra si persisten correos con formato no estándar.</p>
+    <h4>telefono - Contiene solo dígitos (después de la limpieza):</h4>
+    <p>Todos los teléfonos contienen solo dígitos o son nulos después de la limpieza: {telefono_solo_digitos_limpio}</p>
+    """
+
+    # KPIs
+    kpis_html = "<ul>"
+    for k, v in kpis.items():
+        kpis_html += f"<li><b>{k.replace('_', ' ').title()}:</b> {v:.2f}" if isinstance(v, (int, float)) else f"<li><b>{k.replace('_', ' ').title()}:</b> {v}"
+        kpis_html += "</li>"
+    kpis_html += "</ul>"
+
+    # Supuestos y Reglas
+    supuestos_reglas_html = """
+    <h3>3.2. Documentación del Proceso</h3>
+    <h4>Supuestos Adoptados Durante la Limpieza:</h4>
+    <ul>
+        <li><b>Fuente Única para Edad:</b> Se asume que <code>fecha_nacimiento</code> es la fuente más confiable para determinar la <code>edad</code>. Si <code>fecha_nacimiento</code> es válida, se prioriza el cálculo de la edad a partir de ella sobre el valor <code>edad</code> existente si este es nulo o inconsistente. La edad se calcula como la diferencia en años a la fecha actual, ajustando por mes y día.</li>
+        <li><b>Formato de <code>sexo</code>:</b> Se asume que los valores 'Female', 'female', 'Male', 'male', 'F', 'f', 'M', 'm' y sus variaciones deben ser estandarizados a 'Female' y 'Male'. Cualquier otro valor (NaN, vacío, o no reconocido) se convierte a <code>None</code>.</li>
+        <li><b>Formato de <code>telefono</code>:</b> Se asume que los números de teléfono deben contener solo dígitos. Cualquier otro carácter (guiones, espacios, paréntesis, etc.) es removido. Las cadenas vacías o que solo consisten en espacios resultantes de esta limpieza se interpretan como nulas (<code>None</code>).</li>
+        <li><b>Coherencia de Fechas:</b> Se asume que las fechas de nacimiento no pueden ser en el futuro ni excesivamente antiguas (la edad se calcula en relación con la fecha actual y las edades negativas se descartan, convirtiéndolas a <code>None</code>).</li>
+        <li><b>ID de Paciente:</b> Se asume que <code>id_paciente</code> es el identificador único de cada paciente y no se espera que tenga problemas de calidad (duplicados, nulos).</li>
+    </ul>
+    <h4>Reglas de Validación Implementadas:</h4>
+    <ul>
+        <li><b>Validación de <code>fecha_nacimiento</code>:</b> Se verifica que la columna pueda ser convertida a tipo <code>datetime</code>. Los valores que no cumplen con este formato se marcan como <code>NaT</code> (Not a Time).</li>
+        <li><b>Validación de <code>edad</code>:</b>
+            <ul>
+                <li>Debe ser un entero no negativo.</li>
+                <li>Debe ser consistente con <code>fecha_nacimiento</code>: la <code>edad</code> calculada a partir de <code>fecha_nacimiento</code> debe ser cercana a la <code>edad</code> reportada (se permite una tolerancia de 1 año para posibles discrepancias de actualización de fechas en los datos originales).</li>
+            </ul>
+        </li>
+        <li><b>Validación de <code>sexo</code>:</b> Los valores deben estar dentro de un conjunto predefinido de categorías estandarizadas (Female, Male o <code>None</code>).</li>
+        <li><b>Validación de <code>email</code>:</b> Se verifica que el formato siga una expresión regular básica (<code>[^@]+@[^@]+\.[^@]+</code>) para asegurar que contenga un <code>@</code> y al menos un <code>.</code> en el dominio. Esta es una validación de patrón, no de existencia.</li>
+        <li><b>Validación de <code>telefono</code>:</b> Se verifica que, después de la limpieza, la columna contenga solo caracteres numéricos (o sea nula).</li>
+    </ul>
+    """
+
+    # Recomendaciones
+    recomendaciones_html = """
+    <h4>Recomendaciones de Mejora para Asegurar la Calidad Futura de los Datos:</h4>
+    <ul>
+        <li><b>Validación en Origen:</b> Implementar validaciones a nivel de entrada de datos (ej., formularios web, bases de datos) para <code>fecha_nacimiento</code>, <code>sexo</code>, <code>email</code> y <code>telefono</code>.
+            <ul>
+                <li><code>fecha_nacimiento</code>: Usar selectores de fecha para prevenir entradas manuales erróneas y asegurar formato <code>AAAA-MM-DD</code>.</li>
+                <li><code>sexo</code>: Usar listas desplegables con opciones predefinidas (Female, Male) para evitar inconsistencias de capitalización o errores tipográficos.</li>
+                <li><code>email</code>: Implementar validación de formato de correo electrónico en tiempo real en la entrada de datos y, si es posible, una verificación de dominio.</li>
+                <li><code>telefono</code>: Forzar la entrada de solo dígitos o un formato específico (ej., con máscaras de entrada) dependiendo del país, y validar longitud mínima/máxima.</li>
+            </ul>
+        </li>
+        <li><b>Estandarización de <code>ciudad</code>:</b> Implementar un catálogo o lista maestra de ciudades/municipios para asegurar consistencia y evitar variaciones en los nombres de ciudades (ej., "Barranquilla" vs "barranquilla", o errores tipográficos).</li>
+        <li><b>Definición de Campos Obligatorios:</b> Establecer claramente qué campos son obligatorios (ej., <code>id_paciente</code>, <code>nombre</code>, <code>fecha_nacimiento</code>, <code>sexo</code>) en la base de datos o sistema de entrada para reducir la aparición de valores nulos críticos.</li>
+        <li><b>Auditorías Regulares de Datos:</b> Realizar auditorías periódicas de la base de datos para identificar nuevos patrones de error o degradación de la calidad de los datos con el tiempo.</li>
+        <li><b>Documentación de Metadatos:</b> Mantener un diccionario de datos actualizado que defina claramente cada campo, su tipo de dato esperado, formato, reglas de validación y significado, accesible para todo el equipo.</li>
+        <li><b>Sistema de Reporte de Errores:</b> Establecer un mecanismo para que los usuarios (personal del hospital, médicos) reporten inconsistencias o errores en los datos cuando los detecten, con un flujo claro para su corrección.</li>
+        <li><b>Capacitación del Personal:</b> Asegurar que el personal encargado de la entrada de datos esté continuamente capacitado en las mejores prácticas de entrada de datos y comprenda la importancia de la calidad de los datos para la toma de decisiones y la atención al paciente.</li>
+    </ul>
+    """
+    
+    # Ensamblar el informe completo
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Informe de Calidad de Datos de Pacientes</title>
+        <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <style>
+            body {{ font-family: 'Arial', sans-serif; line-height: 1.6; color: #333; margin: 20px; }}
+            .container {{ max-width: 1200px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
+            h1, h2, h3, h4 {{ color: #0056b3; margin-top: 20px; margin-bottom: 15px; }}
+            pre {{ background: #f4f4f4; padding: 10px; border-left: 3px solid #0056b3; overflow-x: auto; }}
+            table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            th {{ background-color: #f2f2f2; }}
+            .observation {{ background-color: #e6f7ff; border-left: 5px solid #2196f3; padding: 10px; margin-top: 10px; margin-bottom: 10px; }}
+            .section {{ margin-bottom: 40px; border-bottom: 1px solid #eee; padding-bottom: 20px; }}
+            .section:last-child {{ border-bottom: none; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1 class="text-center">Informe de Calidad y Análisis de Datos de Pacientes</h1>
+            <p class="text-muted text-center">Generado el: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+
+            <div class="section">
+                <h2>1. Resumen Ejecutivo</h2>
+                <p>Este informe detalla el análisis de calidad de datos, el proceso de limpieza, la generación de indicadores clave de rendimiento (KPIs), el Análisis Exploratorio de Datos (EDA) y los resultados del modelado de Machine Learning (Clustering) aplicado a los datos de pacientes de un hospital.</p>
+                <p>El objetivo principal es transformar los datos crudos en un conjunto de datos limpio, consistente y útil para el análisis y la toma de decisiones, identificando patrones y segmentos de pacientes.</p>
+            </div>
+
+            <div class="section">
+                <h2>2. Indicadores de Calidad de Datos</h2>
+                <h3>2.1. Comparación de Valores Faltantes (%)</h3>
+                {nulos_comp_html}
+                <div class="observation">
+                    <h4>Observaciones:</h4>
+                    <ul>
+                        <li>Se espera una reducción significativa en el porcentaje de nulos en <b>edad</b> si <b>fecha_nacimiento</b> estaba disponible y era válida.</li>
+                        <li><b>fecha_nacimiento</b> puede mostrar un aumento de nulos si los formatos originales eran inválidos y se convirtieron a <code>NaT</code>.</li>
+                        <li><b>telefono</b> puede tener nulos si quedaron cadenas vacías después de limpiar caracteres no numéricos.</li>
+                        <li><b>sexo</b> podría tener nulos si había valores vacíos o no estandarizables.</li>
+                    </ul>
+                </div>
+                <h3>2.2. Comparación de Tipos de Datos</h3>
+                {tipos_comp_html}
+                <div class="observation">
+                    <h4>Observaciones:</h4>
+                    <ul>
+                        <li><b>fecha_nacimiento</b> debería cambiar de <code>object</code> (cadena) a <code>datetime64[ns]</code> (tipo fecha y hora).</li>
+                        <li><b>edad</b> debería cambiar de <code>object</code> (si contenía nulos o estaba mezclado) o <code>float64</code> (si se infirió numérico) a <code>Int64</code> (entero con soporte para nulos).</li>
+                        <li><b>telefono</b> y <b>email</b> idealmente deberían permanecer como <code>object</code> (cadena) pero con formato validado.</li>
+                    </ul>
+                </div>
+                {consistency_html}
+            </div>
+
+            <div class="section">
+                <h2>3. Documentación del Proceso de Limpieza</h2>
+                {supuestos_reglas_html}
+                {recomendaciones_html}
+            </div>
+
+            <div class="section">
+                <h2>4. Key Performance Indicators (KPIs)</h2>
+                {kpis_html}
+            </div>
+
+            <div class="section">
+                <h2>5. Análisis Exploratorio de Datos (EDA)</h2>
+                {eda_plots_html}
+            </div>
+
+            <div class="section">
+                <h2>6. Resultados del Modelo de Clustering</h2>
+                <p>Número óptimo de clusters: <b>{cluster_results.get('n_clusters', 'N/A')}</b></p>
+                <ul>
+                    <li>Puntuación de Silueta: <b>{cluster_results.get('silhouette_score', np.nan):.2f}</b> (indica cuán similar es un objeto a su propio clúster en comparación con otros clústeres)</li>
+                    <li>Índice Davies-Bouldin: <b>{cluster_results.get('davies_bouldin_index', np.nan):.2f}</b> (valores más bajos indican mejor partición)</li>
+                    <li>Índice Calinski-Harabasz: <b>{cluster_results.get('calinski_harabasz_index', np.nan):.2f}</b> (valores más altos indican clusters más densos y bien separados)</li>
+                    <li>Inercia (Sum of Squared Distances): <b>{cluster_results.get('inertia', np.nan):.2f}</b> (distancia intra-cluster, menor es mejor)</li>
+                </ul>
+                {cluster_centers_html}
+                {cluster_counts_html}
+                {cluster_plots_html}
+            </div>
+
+            <div class="section">
+                <h2>7. Conclusiones y Próximos Pasos</h2>
+                <p>El proceso de limpieza ha mejorado significativamente la calidad de los datos, reduciendo nulos y estandarizando formatos. El EDA ha revelado insights clave sobre la demografía de los pacientes. El clustering ha permitido identificar segmentos de pacientes, lo cual puede ser valioso para la atención personalizada y la gestión hospitalaria.</p>
+                <p>Se recomienda implementar las mejoras sugeridas para garantizar la calidad de los datos desde el origen y continuar explorando los segmentos de pacientes identificados para estrategias específicas.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html_content
+
+# --- Cargar datos iniciales ---
+# Simular carga de datos de un CSV o similar
+@st.cache_data
+def load_data():
+    # Datos de ejemplo si no se sube un archivo
+    data = {
+        "id_paciente": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+        "nombre": ["Ana García", "Luis Pérez", "María López", "Juan Rodríguez", "Laura Díaz", "Carlos Sánchez", "Sofía Ramírez", "Pedro Castro", "Elena Morales", "Miguel Herrera", "Isabel Gómez", "Francisco Ruiz", "Carmen Navarro", "Jorge Torres", "Lucía Gil", "Manuel Vargas", "Patricia Ortiz", "Ricardo Nuñez", "Andrea Salas", "Diego Blanco"],
+        "fecha_nacimiento": ["1985-03-10", "1970-11-22", "1992-07-01", "1965-01-15", "1988-09-30", "1975-04-05", "2000-02-28", "1950-12-03", "1980-06-18", "1995-10-01", "1978-03-25", "1960-08-12", "1990-05-20", "1982-01-01", "2005-04-14", "1973-09-09", "1989-11-11", "1968-06-06", "1998-07-07", "1955-02-02"],
+        "edad": [38, 53, 31, 58, 35, 48, 23, 73, 43, 28, 45, 63, 33, 41, 18, 50, 34, 55, 25, 68],
+        "sexo": ["Female", "Male", "FEMALE", "male", "Female", "Male", "Female", "Male", "Female", "Male", "F", "M", "Female", "Male", "F", "Male", "Female", "Male", "Female", "Male"],
+        "email": ["ana.g@example.com", "luis.p@ejemplo.com", "maria.l@correo.com", "juan.r@dominio.org", "laura.d@miemail.es", "carlos.s@hospital.net", "sofia.r@outlook.com", "pedro.c@gmail.com", "elena.m@yahoo.com", "miguel.h@email.com", "isabel.g@proveedor.com", "francisco.r@empresa.com", "carmen.n@hospital.org", "jorge.t@email.es", "lucia.g@dominio.net", "manuel.v@correolibre.com", "patricia.o@correo.es", "ricardo.n@mihospital.com", "andrea.s@ejemplo.net", "diego.b@gmail.com"],
+        "telefono": ["3101234567", "3009876543", "3205551234", "3158889900", "3011112233", "3054445566", "3127778899", "3182223344", "3169990011", "3046667788", "3173334455", "3020001122", "3136667788", "3191112233", "3034445566", "3147778899", "3210009988", "3062223344", "3225556677", "3118887766"],
+        "ciudad": ["Bogotá", "Medellín", "Cali", "Barranquilla", "Cartagena", "Cali", "Medellín", "Bogotá", "Bogotá", "Barranquilla", "Bogotá", "Medellín", "Cali", "Barranquilla", "Cartagena", "Bogotá", "Medellín", "Cali", "Bogotá", "Barranquilla"]
+    }
+    df = pd.DataFrame(data)
+    # Introducir algunos nulos y datos inconsistentes intencionalmente para la demostración
+    df.loc[1, 'edad'] = None # Nulo en edad
+    df.loc[2, 'sexo'] = 'Otro' # Valor inconsistente en sexo
+    df.loc[4, 'fecha_nacimiento'] = '1988/09/30' # Formato diferente de fecha
+    df.loc[5, 'telefono'] = '305-444-55-66' # Formato con guiones
+    df.loc[6, 'email'] = 'sofia.r@outlook' # Email inválido
+    df.loc[7, 'edad'] = -5 # Edad negativa
+    df.loc[8, 'fecha_nacimiento'] = '2030-01-01' # Fecha futura
+    df.loc[10, 'telefono'] = '    ' # Teléfono solo espacios
+    df.loc[11, 'ciudad'] = 'bogota' # Ciudad con minúscula
+    df.loc[12, 'sexo'] = '' # Sexo vacío
+    df.loc[14, 'edad'] = 150 # Edad irreal
+    df.loc[17, 'email'] = 'ricardo@.com' # Email inválido
+
+    return df
+
+df_pacientes = load_data()
+
+# --- Título de la Aplicación ---
+st.title("🏥 Análisis y Calidad de Datos de Pacientes de Hospital")
+st.markdown("""
+Esta aplicación realiza un análisis exhaustivo de la calidad de los datos de pacientes, 
+seguido de procesos de limpieza, validación, generación de KPIs, EDA avanzado y 
+un modelo de Machine Learning (Clustering) para identificar segmentos de pacientes.
+""")
 
 # --- Inicializar st.session_state para guardar los resultados entre secciones ---
 # Esto es CRÍTICO para evitar KeyErrors al acceder a variables de sesión
@@ -104,1351 +507,566 @@ if 'indicators_cleaned' not in st.session_state:
     st.session_state['indicators_cleaned'] = {}
 
 
-# --- Sidebar para Navegación ---
-st.sidebar.header("Navegación")
-selected_section = st.sidebar.radio(
-    "Ir a la sección:",
-    ("1. Exploración Inicial", "2. Limpieza y Validación", "3. Indicadores y Documentación", "4. EDA Avanzado & Dashboards", "5. Modelado de Machine Learning")
-)
-
-# --- Contenido Principal de la Aplicación ---
-
-# Sección 1: Análisis de Calidad de Datos (Exploración)
-if selected_section == "1. Exploración Inicial":
-    st.header("1. 📉 Análisis de Calidad de Datos (Exploración)")
-    st.markdown("Identificación de los principales problemas de calidad en la tabla de pacientes.")
-
-    if df_pacientes.empty:
-        st.warning("No se pudieron cargar los datos de pacientes o el DataFrame está vacío.")
-    else:
-        st.subheader("1.1. Vista Previa de Datos Originales")
-        st.dataframe(df_pacientes.head())
-
-        st.subheader("1.2. Información General y Tipos de Datos")
-        buffer = pd.io.common.StringIO()
-        df_pacientes.info(buf=buffer)
-        s = buffer.getvalue()
-        st.text(s)
-
-        st.subheader("1.3. Valores Faltantes (Nulos)")
-        missing_values = df_pacientes.isnull().sum()
-        missing_percentage = (df_pacientes.isnull().sum() / len(df_pacientes)) * 100
-        missing_df = pd.DataFrame({
-            'Valores Faltantes': missing_values,
-            'Porcentaje (%)': missing_percentage
-        }).sort_values(by='Porcentaje (%)', ascending=False)
-        st.dataframe(missing_df[missing_df['Valores Faltantes'] > 0])
-
-        if not missing_df[missing_df['Valores Faltantes'] > 0].empty:
-            st.markdown("""
-            **Observaciones Iniciales sobre Valores Faltantes:**
-            - **`edad`**: Muestra `null` en el JSON para algunos registros. Esto es un problema, ya que la edad es crucial y puede calcularse a partir de la fecha de nacimiento.
-            - **`fecha_nacimiento`**: Aunque no hay nulos directos, es importante verificar el formato y la validez de la fecha.
-            """)
-        else:
-            st.info("No se detectaron valores faltantes significativos en los datos cargados.")
-
-        st.subheader("1.4. Inconsistencias y Formatos")
-
-        st.markdown("#### Columna `sexo`")
-        st.write(df_pacientes['sexo'].value_counts(dropna=False))
-        # Convertir a minúsculas para verificar inconsistencias más fácilmente
-        sex_lower_unique = df_pacientes['sexo'].astype(str).str.lower().unique()
-        # Verificar si hay más de dos categorías únicas (sin contar NaN) o si hay 'f'/'m' que necesitan mapeo
-        if len(sex_lower_unique[sex_lower_unique != 'nan']) > 2 or any(s in ['f', 'm'] for s in sex_lower_unique):
-            st.warning("Problema: Inconsistencia en la capitalización o variaciones en la columna `sexo` (ej., 'Female' vs 'female', 'F' vs 'f', 'M' vs 'm', u otros valores inesperados).")
-        else:
-            st.info("La columna `sexo` parece estar relativamente estandarizada o con pocas inconsistencias (requerirá limpieza).")
-
-
-        st.markdown("#### Columna `fecha_nacimiento`")
-        # Verificar formatos de fecha inválidos
-        invalid_dates = df_pacientes[pd.to_datetime(df_pacientes['fecha_nacimiento'], errors='coerce').isna() & df_pacientes['fecha_nacimiento'].notna()]
-        if not invalid_dates.empty:
-            st.warning(f"Problema: Se encontraron **{len(invalid_dates)}** fechas de nacimiento con formato inválido.")
-            st.dataframe(invalid_dates)
-        else:
-            st.info("No se encontraron formatos de fecha de nacimiento inválidos aparentes.")
-
-        st.markdown("#### Columna `email`")
-        # Validación básica de email
-        invalid_emails = df_pacientes[~df_pacientes['email'].astype(str).str.match(r'[^@]+@[^@]+\.[^@]+', na=False)]
-        if not invalid_emails.empty:
-            st.warning(f"Problema: Se encontraron **{len(invalid_emails)}** correos electrónicos con formato potencialmente inválido.")
-            st.dataframe(invalid_emails.head())
-        else:
-            st.info("No se encontraron formatos de correo electrónico inválidos aparentes (validación básica).")
-
-        st.markdown("#### Columna `telefono`")
-        # Validación básica de teléfono (solo si no es nulo y no es un número después de limpiar no-dígitos)
-        # Primero, intentar limpiar para verificar si persisten los problemas.
-        temp_telefono_cleaned = df_pacientes['telefono'].astype(str).str.replace(r'[^0-9]', '', regex=True)
-        non_numeric_phones_after_temp_clean = df_pacientes[temp_telefono_cleaned.notna() & ~temp_telefono_cleaned.str.isdigit()]
-        if not non_numeric_phones_after_temp_clean.empty:
-            st.warning(f"Problema: Se encontraron **{len(non_numeric_phones_after_temp_clean)}** números de teléfono con caracteres no numéricos o que no se convierten a un formato numérico válido.")
-            st.dataframe(non_numeric_phones_after_temp_clean.head())
-        else:
-            st.info("No se encontraron números de teléfono no numéricos aparentes.")
-
-
-        st.markdown("""
-        ### **Resumen de Problemas de Calidad (Pacientes):**
-
-        1.  **Valores Nulos:** Principalmente en la columna `edad`.
-        2.  **Inconsistencias de Formato:**
-            * `sexo`: Posibles variaciones en la capitalización (`Female` vs `female`), o abreviaciones (`F` vs `f`).
-            * `fecha_nacimiento`: Necesita conversión a tipo `datetime` y manejo de posibles formatos incorrectos.
-            * `edad`: Debe ser un valor numérico y consistente con `fecha_nacimiento`. Si es `null`, debe ser calculado.
-            * `email`, `telefono`: Requieren validación de formato (aunque el ejemplo dado parece limpio, es buena práctica).
-        3.  **Coherencia de Datos:** `edad` debe ser derivable de `fecha_nacimiento` y ser un número positivo.
-        """)
-        st.info("Nota: Dado que solo tenemos la tabla 'pacientes' de la URL, el análisis se centra en ella.")
-
-
-# Sección 2: Limpieza y Validación
-elif selected_section == "2. Limpieza y Validación":
-    st.header("2. 🧹 Limpieza y Validación")
-    st.markdown("Aplicación de un proceso de limpieza para resolver los problemas identificados y validaciones cruzadas.")
-
-    # Siempre empezar con una copia del original para la limpieza de esta sesión
-    df_cleaned = st.session_state['df_original'].copy()
-    current_date = date.today() # Definir la fecha actual una vez
-
-    # --- Limpieza de Datos ---
-    st.subheader("2.1. Proceso de Limpieza")
-
-    st.markdown("#### Limpieza de `sexo`")
-    st.code("""
-# Convertir a cadena y a minúsculas para un manejo consistente
-df_cleaned['sexo'] = df_cleaned['sexo'].astype(str).str.lower()
-
-# Mapear valores a 'Female', 'Male' o np.nan para no mapeados
-sex_mapping = {
-    'f': 'Female',
-    'female': 'Female',
-    'm': 'Male',
-    'male': 'Male'
-}
-df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping) # Esto generará np.nan para valores no mapeados
-
-# Finalmente, reemplazar np.nan con None (Python None)
-df_cleaned.loc[df_cleaned['sexo'].isna(), 'sexo'] = None
-""")
-    # Aplicar la lógica de limpieza y mapeo
-    df_cleaned['sexo'] = df_cleaned['sexo'].astype(str).str.lower()
-    sex_mapping = {
-        'f': 'Female',
-        'female': 'Female',
-        'm': 'Male',
-        'male': 'Male'
-    }
-    df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping) # Genera np.nan para no mapeados
-
-    # Rellenar np.nan (si los hay) con Python None
-    df_cleaned.loc[df_cleaned['sexo'].isna(), 'sexo'] = None
-
-    st.write("Valores de `sexo` después de la normalización y mapeo:")
-    st.write(df_cleaned['sexo'].value_counts(dropna=False))
-    st.markdown("""
-    **Justificación:** Los valores de la columna `sexo` se normalizan a minúsculas y luego se mapean explícitamente a `'Female'` o `'Male'`. Cualquier valor que no coincida con estas categorías mapeadas (incluyendo cadenas vacías, 'nan', o 'Other') se convierte a `None` (nulo), asegurando una consistencia total para análisis y filtros. Se utiliza `numpy.nan` para el manejo intermedio de nulos, que es la forma estándar de Pandas.
-    """)
-
-    st.markdown("#### Limpieza y Cálculo de `fecha_nacimiento` y `edad`")
-    st.code("""
-# Convertir 'fecha_nacimiento' a datetime, forzando nulos si el formato es inválido
-df_cleaned['fecha_nacimiento'] = pd.to_datetime(df_cleaned['fecha_nacimiento'], errors='coerce')
-
-# Calcular 'edad' para nulos o valores inconsistentes
-current_date = date.today() # Fecha actual
-df_cleaned['edad_calculada'] = df_cleaned['fecha_nacimiento'].apply(lambda dob: calculate_age_from_dob(dob, current_date))
-
-# Priorizar edad calculada si fecha_nacimiento es válida, de lo contrario usar existente o None
-df_cleaned['edad'] = df_cleaned.apply(
-    lambda row: row['edad_calculada'] if pd.notna(row['edad_calculada']) else row['edad'], axis=1
-)
-df_cleaned['edad'] = df_cleaned['edad'].astype('Int64') # Int64 para permitir NaNs y mantenerlo entero
-""")
-    # Aplicar limpieza de fecha y edad
-    df_cleaned['fecha_nacimiento'] = pd.to_datetime(df_cleaned['fecha_nacimiento'], errors='coerce')
-    df_cleaned['edad_calculada'] = df_cleaned['fecha_nacimiento'].apply(lambda dob: calculate_age_from_dob(dob, current_date))
-    df_cleaned['edad'] = df_cleaned.apply(
-        lambda row: row['edad_calculada'] if pd.notna(row['edad_calculada']) else row['edad'], axis=1
-    )
-    df_cleaned['edad'] = df_cleaned['edad'].astype('Int64')
-    df_cleaned = df_cleaned.drop(columns=['edad_calculada']) # Eliminar columna temporal
-    st.write("Valores nulos en `edad` después de la limpieza:", df_cleaned['edad'].isna().sum())
-    st.write("Valores nulos en `fecha_nacimiento` después de la limpieza:", df_cleaned['fecha_nacimiento'].isna().sum())
-    st.markdown("""
-    **Justificación:**
-    - `fecha_nacimiento` se convierte a tipo `datetime`, convirtiendo formatos inválidos a `NaT` (Not a Time).
-    - `edad` se recalcula basándose en `fecha_nacimiento` si es válida. Esta edad calculada se prioriza si está disponible. Si `fecha_nacimiento` es `NaT`, se mantiene la `edad` original.
-    - Asegura que la edad sea un entero no negativo. Se usa `Int64` para manejar nulos en columnas numéricas.
-    """)
-
-    st.markdown("#### Limpieza de `telefono`")
-    st.code("""
-# Eliminar caracteres no numéricos
-df_cleaned['telefono'] = df_cleaned['telefono'].astype(str).str.replace(r'[^0-9]', '', regex=True)
-# Reemplazar cadenas vacías (o solo espacios) con None
-df_cleaned.loc[df_cleaned['telefono'].str.strip() == '', 'telefono'] = None
-""")
-    df_cleaned['telefono'] = df_cleaned['telefono'].astype(str).str.replace(r'[^0-9]', '', regex=True)
-    df_cleaned.loc[df_cleaned['telefono'].str.strip() == '', 'telefono'] = None # Reemplazar cadenas vacías con None
-    st.write("Ejemplos de `telefono` después de la limpieza:")
-    st.dataframe(df_cleaned['telefono'].head())
-    st.markdown("**Justificación:** Se eliminan caracteres no numéricos del teléfono para estandarizar el formato. Las cadenas vacías o aquellas con solo espacios se convierten a `None`.")
-
-    st.subheader("2.2. Validaciones Cruzadas")
-    st.markdown("Se aplican reglas para asegurar la consistencia lógica entre columnas.")
-
-    st.markdown("#### Validación: `edad` consistente con `fecha_nacimiento`")
-    # Recalcular edad para comparar con la edad final limpia
-    df_cleaned_temp_age_check = df_cleaned.copy()
-    df_cleaned_temp_age_check['calculated_age_for_check'] = df_cleaned_temp_age_check['fecha_nacimiento'].apply(lambda dob: calculate_age_from_dob(dob, current_date))
-
-    inconsistent_ages = df_cleaned[
-        (df_cleaned['edad'].notna()) &
-        (df_cleaned_temp_age_check['calculated_age_for_check'].notna()) &
-        (abs(df_cleaned['edad'] - df_cleaned_temp_age_check['calculated_age_for_check']) > 1) # Tolerancia de 1 año por posibles discrepancias de actualización
+# --- Barra Lateral para Navegación ---
+st.sidebar.title("Navegación")
+section = st.sidebar.radio(
+    "Ir a:",
+    [
+        "1. Carga y Exploración Inicial",
+        "2. Limpieza y Validación de Datos",
+        "3. Indicadores de Calidad y Documentación",
+        "4. EDA Avanzado & Dashboards",
+        "5. Modelado de Machine Learning (Clustering)"
     ]
-    if not inconsistent_ages.empty:
-        st.warning(f"Se encontraron **{len(inconsistent_ages)}** registros con **edad inconsistente** con la fecha de nacimiento (diferencia > 1 año) *después de la limpieza*.")
-        st.dataframe(inconsistent_ages[['id_paciente', 'fecha_nacimiento', 'edad']].head())
-        st.markdown("""
-        **Regla de Validación:** La edad calculada a partir de `fecha_nacimiento` debe ser consistente con la `edad` reportada (se permite una pequeña tolerancia para posibles discrepancias de actualización de fechas).
-        **Acción:** La limpieza ya prioriza la edad calculada si `fecha_nacimiento` es válida, minimizando estas inconsistencias. Si aún existen, podría indicar un `fecha_nacimiento` erróneo.
-        """)
+)
+
+# --- Sección 1: Carga y Exploración Inicial ---
+if section == "1. Carga y Exploración Inicial":
+    st.header("1. Carga y Exploración Inicial de Datos")
+    st.write("Carga tu propio archivo CSV o usa los datos de ejemplo precargados.")
+
+    uploaded_file = st.file_uploader("Sube tu archivo CSV de pacientes", type="csv")
+
+    if uploaded_file is not None:
+        try:
+            df_pacientes = pd.read_csv(uploaded_file)
+            st.session_state['df_original'] = df_pacientes.copy()
+            st.session_state['df_cleaned'] = df_pacientes.copy() # Inicializar df_cleaned también
+            st.success("Archivo cargado exitosamente.")
+        except Exception as e:
+            st.error(f"Error al leer el archivo: {e}. Asegúrate de que sea un CSV válido.")
+            df_pacientes = load_data() # Volver a cargar datos de ejemplo si hay error
+            st.session_state['df_original'] = df_pacientes.copy()
+            st.session_state['df_cleaned'] = df_pacientes.copy() # Inicializar df_cleaned
+            st.info("Se han cargado los datos de ejemplo en su lugar.")
     else:
-        st.success("No se encontraron inconsistencias significativas entre `edad` y `fecha_nacimiento` después de la limpieza.")
+        st.info("Usando datos de ejemplo precargados. Puedes subir tu propio CSV.")
+        df_pacientes = st.session_state['df_original'] # Asegurarse de usar el original cargado/ejemplo
 
-    st.markdown("#### Validación: `email` con formato válido")
-    invalid_email_after_clean = df_cleaned[~df_cleaned['email'].astype(str).str.match(r'[^@]+@[^@]+\.[^@]+', na=False)]
-    if not invalid_email_after_clean.empty:
-        st.warning(f"Se encontraron **{len(invalid_email_after_clean)}** registros con **correo electrónico inválido** después de la limpieza.")
-        st.dataframe(invalid_email_after_clean[['id_paciente', 'email']].head())
-        st.markdown("""
-        **Regla de Validación:** El campo `email` debe seguir un formato de correo electrónico estándar (`texto@texto.dominio`).
-        **Acción:** Se identifican pero no se modifican automáticamente, ya que esto requeriría inferencia o interacción manual.
-        """)
-    else:
-        st.success("Todos los correos electrónicos parecen tener un formato válido después de la limpieza (validación básica).")
+    st.subheader("Vista Previa de los Datos Originales")
+    st.dataframe(df_pacientes.head())
 
-    st.markdown("#### Validación: `telefono` contiene solo dígitos (después de la limpieza)")
-    non_numeric_phones_cleaned = df_cleaned[df_cleaned['telefono'].notna() & ~df_cleaned['telefono'].astype(str).str.isdigit()]
-    if not non_numeric_phones_cleaned.empty:
-        st.warning(f"Se encontraron **{len(non_numeric_phones_cleaned)}** registros con **números de teléfono que contienen caracteres no numéricos** después de la limpieza (esto no debería ocurrir si la limpieza fue efectiva).")
-        st.dataframe(non_numeric_phones_cleaned[['id_paciente', 'telefono']].head())
-    else:
-        st.success("Todos los teléfonos contienen solo dígitos o son nulos después de la limpieza.")
+    st.subheader("Información General del DataFrame")
+    buffer = StringIO()
+    df_pacientes.info(buf=buffer)
+    st.text(buffer.getvalue())
 
-    # --- NUEVA FUNCIONALIDAD: Detección y Manejo de Duplicados ---
-    st.subheader("2.4. Detección y Manejo de Duplicados")
-    st.markdown("Identifica y gestiona registros duplicados en el dataset.")
+    st.subheader("Estadísticas Descriptivas")
+    st.dataframe(df_pacientes.describe(include='all'))
 
-    # Opciones para detectar duplicados
-    duplicate_check_cols = st.multiselect(
-        "Selecciona las columnas para detectar duplicados:",
-        df_cleaned.columns.tolist(),
-        default=['id_paciente', 'nombre', 'fecha_nacimiento', 'telefono'], # Sugerencia de columnas
-        key="duplicate_cols_select"
-    )
+    st.subheader("Valores Nulos por Columna (Original)")
+    nulos_original = df_pacientes.isnull().sum()
+    nulos_original_pct = (df_pacientes.isnull().sum() / len(df_pacientes)) * 100
+    df_nulos_original = pd.DataFrame({
+        'Nulos': nulos_original,
+        'Porcentaje (%)': nulos_original_pct
+    }).sort_values(by='Porcentaje (%)', ascending=False)
+    st.dataframe(df_nulos_original)
 
-    if st.button("Buscar Duplicados y Aplicar Acción", key="find_duplicates_btn"):
-        if not duplicate_check_cols:
-            st.warning("Por favor, selecciona al menos una columna para detectar duplicados.")
-        else:
-            # keep=False marca todas las ocurrencias de duplicados como True
-            duplicates = df_cleaned[df_cleaned.duplicated(subset=duplicate_check_cols, keep=False)]
-
-            if not duplicates.empty:
-                st.warning(f"Se encontraron **{len(duplicates)}** registros duplicados (considerando todas las ocurrencias) basados en las columnas seleccionadas.")
-                st.dataframe(duplicates.sort_values(by=duplicate_check_cols))
-
-                duplicate_action = st.radio(
-                    "¿Qué acción deseas tomar con los duplicados?",
-                    ("No hacer nada", "Eliminar duplicados (mantener la primera ocurrencia)", "Eliminar duplicados (mantener la última ocurrencia)"),
-                    key="duplicate_action_radio"
-                )
-
-                if duplicate_action == "Eliminar duplicados (mantener la primera ocurrencia)":
-                    df_cleaned = df_cleaned.drop_duplicates(subset=duplicate_check_cols, keep='first')
-                    st.success(f"Duplicados eliminados. El DataFrame ahora tiene {len(df_cleaned)} registros.")
-                elif duplicate_action == "Eliminar duplicados (mantener la última ocurrencia)":
-                    df_cleaned = df_cleaned.drop_duplicates(subset=duplicate_check_cols, keep='last')
-                    st.success(f"Duplicados eliminados. El DataFrame ahora tiene {len(df_cleaned)} registros.")
-            else:
-                st.info("No se encontraron registros duplicados basados en las columnas seleccionadas.")
-
-    # --- NUEVA FUNCIONALIDAD: Gestión de Valores Atípicos (Outliers) ---
-    st.subheader("2.5. Gestión de Valores Atípicos (Outliers)")
-    st.markdown("Identifica y opcionalmente maneja los valores atípicos en columnas numéricas.")
-
-    numeric_cols_for_outliers = df_cleaned.select_dtypes(include=np.number).columns.tolist()
-
-    outlier_col = st.selectbox(
-        "Selecciona una columna numérica para detectar outliers:",
-        numeric_cols_for_outliers,
-        key="outlier_col_select"
-    )
-
-    if outlier_col and not df_cleaned[outlier_col].dropna().empty:
-        Q1 = df_cleaned[outlier_col].quantile(0.25)
-        Q3 = df_cleaned[outlier_col].quantile(0.75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
-
-        outliers = df_cleaned[(df_cleaned[outlier_col] < lower_bound) | (df_cleaned[outlier_col] > upper_bound)]
-
-        st.write(f"**Límites de Detección de Outliers (IQR) para '{outlier_col}':**")
-        st.write(f"Q1: {Q1:.2f}, Q3: {Q3:.2f}, IQR: {IQR:.2f}")
-        st.write(f"Límite Inferior: {lower_bound:.2f}, Límite Superior: {upper_bound:.2f}")
-
-        if not outliers.empty:
-            st.warning(f"Se encontraron **{len(outliers)}** valores atípicos en la columna '{outlier_col}'.")
-            st.dataframe(outliers[['id_paciente', outlier_col]].head())
-
-            outlier_action = st.radio(
-                "¿Qué acción deseas tomar con los valores atípicos?",
-                ("No hacer nada", "Eliminar outliers", "Imputar outliers por la mediana", "Capping (limitar al rango IQR)"),
-                key="outlier_action_radio"
-            )
-
-            if outlier_action == "Eliminar outliers":
-                df_cleaned = df_cleaned[(df_cleaned[outlier_col] >= lower_bound) & (df_cleaned[outlier_col] <= upper_bound)]
-                st.success(f"Outliers eliminados. El DataFrame ahora tiene {len(df_cleaned)} registros.")
-            elif outlier_action == "Imputar outliers por la mediana":
-                median_val = df_cleaned[outlier_col].median()
-                df_cleaned.loc[(df_cleaned[outlier_col] < lower_bound) | (df_cleaned[outlier_col] > upper_bound), outlier_col] = median_val
-                st.success(f"Outliers imputados por la mediana ({median_val:.2f}).")
-            elif outlier_action == "Capping (limitar al rango IQR)":
-                df_cleaned[outlier_col] = np.where(df_cleaned[outlier_col] < lower_bound, lower_bound, df_cleaned[outlier_col])
-                df_cleaned[outlier_col] = np.where(df_cleaned[outlier_col] > upper_bound, upper_bound, df_cleaned[outlier_col])
-                st.success(f"Outliers limitados al rango IQR ({lower_bound:.2f} - {upper_bound:.2f}).")
-        else:
-            st.info(f"No se encontraron valores atípicos en la columna '{outlier_col}' usando el método IQR.")
-    elif outlier_col:
-         st.info(f"No hay datos numéricos para analizar en la columna '{outlier_col}'.")
-
-    # --- NUEVA FUNCIONALIDAD: Análisis de Completitud con Umbrales ---
-    st.subheader("2.6. Análisis de Completitud por Umbral")
-    st.markdown("Verifica qué columnas cumplen con un umbral de datos no nulos.")
-
-    completeness_threshold = st.slider("Porcentaje mínimo de completitud deseado (% no nulos):", 0, 100, 90, key="completeness_slider")
-
-    # Recalcular después de posibles eliminaciones de duplicados/outliers
-    non_null_percentage = (df_cleaned.count() / len(df_cleaned)) * 100
-    completeness_df = pd.DataFrame({
-        'Porcentaje No Nulo (%)': non_null_percentage,
-        'Cumple Umbral': non_null_percentage >= completeness_threshold
-    }).sort_values(by='Porcentaje No Nulo (%)', ascending=False)
-
-    st.dataframe(completeness_df)
-
-    cols_below_threshold = completeness_df[completeness_df['Cumple Umbral'] == False]
-    if not cols_below_threshold.empty:
-        st.warning(f"Las siguientes columnas no cumplen con el umbral de {completeness_threshold}% de completitud:")
-        st.dataframe(cols_below_threshold)
-    else:
-        st.success(f"Todas las columnas cumplen con el umbral de {completeness_threshold}% de completitud.")
-
-    # --- NUEVA FUNCIONALIDAD: Validación de Rangos Numéricos ---
-    st.subheader("2.7. Validación de Rangos Numéricos")
-    st.markdown("Verifica si los valores de una columna numérica están dentro de un rango aceptable.")
-
-    range_col = st.selectbox(
-        "Selecciona una columna numérica para validar el rango:",
-        numeric_cols_for_outliers,
-        key="range_col_select"
-    )
-
-    if range_col:
-        current_min = int(df_cleaned[range_col].min()) if not df_cleaned[range_col].dropna().empty else 0
-        current_max = int(df_cleaned[range_col].max()) if not df_cleaned[range_col].dropna().empty else 120
-
-        min_val = st.number_input(f"Valor mínimo aceptable para {range_col}:", value=min(0, current_min), key=f"min_{range_col}_input")
-        max_val = st.number_input(f"Valor máximo aceptable para {range_col}:", value=max(120, current_max), key=f"max_{range_col}_input")
-
-        if min_val >= max_val:
-            st.error("El valor mínimo debe ser menor que el valor máximo.")
-        else:
-            invalid_range_records = df_cleaned[
-                (df_cleaned[range_col].notna()) &
-                ((df_cleaned[range_col] < min_val) | (df_cleaned[range_col] > max_val))
-            ]
-
-            if not invalid_range_records.empty:
-                st.warning(f"Se encontraron **{len(invalid_range_records)}** registros en '{range_col}' fuera del rango [{min_val}, {max_val}].")
-                st.dataframe(invalid_range_records[['id_paciente', range_col]].head())
-                st.markdown("""
-                **Acción:** Estos valores pueden ser errores de entrada. Considera eliminarlos, imputarlos o corregirlos manualmente.
-                """)
-            else:
-                st.success(f"Todos los valores en '{range_col}' están dentro del rango [{min_val}, {max_val}].")
-
-    st.subheader("2.8. DataFrame Después de la Limpieza")
-    st.write("Las primeras 10 filas del DataFrame limpio:")
-    st.dataframe(df_cleaned.head(10))
-    st.write("Información del DataFrame limpio:")
-    buffer_cleaned = pd.io.common.StringIO()
-    df_cleaned.info(buf=buffer_cleaned)
-    s_cleaned = buffer_cleaned.getvalue()
-    st.text(s_cleaned)
-
-    # Guardar el DataFrame limpio en el estado de la sesión
-    st.session_state['df_cleaned'] = df_cleaned
+    # Almacenar indicadores originales para la sección 3
+    st.session_state['indicators_original'] = {
+        'sexo_unique_original': df_pacientes['sexo'].unique().tolist(),
+        'email_invalidos_original': (~df_pacientes['email'].astype(str).str.match(r'[^@]+@[^@]+\.[^@]+', na=False)).sum()
+    }
 
 
-# Sección 3: Indicadores de Calidad y Documentación
-elif selected_section == "3. Indicadores y Documentación":
-    st.header("3. 📈 Indicadores de Calidad y Documentación")
-    st.markdown("Resumen de indicadores de calidad antes y después de la limpieza, junto con la documentación.")
+# --- Sección 2: Limpieza y Validación de Datos ---
+elif section == "2. Limpieza y Validación de Datos":
+    st.header("2. Limpieza y Validación de Datos")
+    st.write("Aplica las reglas de limpieza y validación definidas al conjunto de datos.")
 
-    # Asegurarse de que los DataFrames estén disponibles
-    if 'df_cleaned' not in st.session_state or st.session_state['df_cleaned'].empty or 'df_original' not in st.session_state or st.session_state['df_original'].empty:
-        st.warning("Por favor, navega primero a la sección 'Limpieza y Validación' para generar los datos limpios y el estado de la sesión.")
-        st.stop()
-    else:
-        df_original = st.session_state['df_original']
-        df_cleaned = st.session_state['df_cleaned']
+    if st.button("Aplicar Limpieza y Validación"):
+        with st.spinner("Limpiando y validando datos..."):
+            df_cleaned = clean_patient_data(st.session_state['df_original'])
+            st.session_state['df_cleaned'] = df_cleaned
+            st.success("¡Datos limpios y validados!")
 
-        st.subheader("3.1. Indicadores de Calidad de Datos")
-
-        # Función para calcular indicadores de calidad
-        def get_quality_indicators(df):
-            total_rows = len(df)
-            missing_values = df.isnull().sum()
-            missing_percentage = (missing_values / total_rows) * 100
-            data_types = df.dtypes
-
-            indicators = {
-                'Total Registros': total_rows,
-                'Valores Nulos por Columna (%)': missing_percentage.to_dict(),
-                'Tipos de Datos por Columna': {col: str(dtype) for col, dtype in data_types.items()}
+            # Recalcular y almacenar indicadores para la sección 3 (después de limpieza)
+            st.session_state['indicators_cleaned'] = {
+                'sexo_unique_cleaned': df_cleaned['sexo'].unique().tolist(),
+                'email_invalidos_limpio': (~df_cleaned['email'].astype(str).str.match(r'[^@]+@[^@]+\.[^@]+', na=False)).sum(),
+                'telefono_only_digits_cleaned': df_cleaned['telefono'].dropna().apply(lambda x: str(x).isdigit()).all()
             }
-            return indicators
 
-        indicators_original = get_quality_indicators(df_original)
-        indicators_cleaned = get_quality_indicators(df_cleaned)
-
-        st.session_state['indicators_original'] = indicators_original # Guardar para el informe
-        st.session_state['indicators_cleaned'] = indicators_cleaned # Guardar para el informe
+            # También calcular la comparación de nulos para la sección 3
+            st.session_state['df_nulos_comp'] = get_missing_values_comparison(st.session_state['df_original'], st.session_state['df_cleaned'])
 
 
-        st.markdown("#### Comparación de Valores Faltantes (%)")
-        cols = ['edad', 'fecha_nacimiento', 'telefono', 'sexo'] # Columnas relevantes para nulos
-        data_nulos = {
-            'Columna': cols,
-            'Original (%)': [indicators_original['Valores Nulos por Columna (%)'].get(col, 0) for col in cols],
-            'Limpio (%)': [indicators_cleaned['Valores Nulos por Columna (%)'].get(col, 0) for col in cols]
-        }
-        df_nulos_comp = pd.DataFrame(data_nulos)
-        st.dataframe(df_nulos_comp.set_index('Columna'))
-        st.session_state['df_nulos_comp'] = df_nulos_comp # Guardar para el informe
+    st.subheader("Vista Previa de los Datos Limpios")
+    st.dataframe(st.session_state['df_cleaned'].head())
+
+    st.subheader("Información General del DataFrame Limpio")
+    buffer_cleaned = StringIO()
+    st.session_state['df_cleaned'].info(buf=buffer_cleaned)
+    st.text(buffer_cleaned.getvalue())
+
+    st.subheader("Valores Nulos por Columna (Después de Limpieza)")
+    nulos_cleaned = st.session_state['df_cleaned'].isnull().sum()
+    nulos_cleaned_pct = (st.session_state['df_cleaned'].isnull().sum() / len(st.session_state['df_cleaned'])) * 100
+    df_nulos_cleaned = pd.DataFrame({
+        'Nulos': nulos_cleaned,
+        'Porcentaje (%)': nulos_cleaned_pct
+    }).sort_values(by='Porcentaje (%)', ascending=False)
+    st.dataframe(df_nulos_cleaned)
 
 
-        st.markdown("""
-        **Observaciones:**
-        - Se espera una **reducción significativa** en el porcentaje de nulos en `edad` si `fecha_nacimiento` estaba disponible y era válida.
-        - `fecha_nacimiento` puede mostrar un aumento de nulos si los formatos originales eran inválidos y se convirtieron a `NaT`.
-        - `telefono` puede tener nulos si quedaron cadenas vacías después de limpiar caracteres no numéricos.
-        - `sexo` podría tener nulos si había valores vacíos o no estandarizables.
-        """)
+# --- Sección 3: Indicadores de Calidad y Documentación ---
+elif section == "3. Indicadores de Calidad y Documentación":
+    st.header("3. Indicadores de Calidad y Documentación")
+    st.write("Resumen de indicadores de calidad antes y después de la limpieza, junto con la documentación.")
 
-        st.markdown("#### Comparación de Tipos de Datos")
-        st.write("Tipos de datos originales:")
-        st.json(indicators_original['Tipos de Datos por Columna'])
-        st.write("Tipos de datos después de la limpieza:")
-        st.json(indicators_cleaned['Tipos de Datos por Columna'])
-        st.markdown("""
-        **Observaciones:**
-        - `fecha_nacimiento` debería cambiar de `object` (cadena) a `datetime64[ns]` (tipo fecha y hora).
-        - `edad` debería cambiar de `object` (si contenía nulos o estaba mezclado) o `float64` (si se infirió numérico) a `Int64` (entero con soporte para nulos).
-        - `telefono` y `email` idealmente deberían permanecer como `object` (cadena) pero con formato validado.
-        """)
+    st.subheader("3.1. Indicadores de Calidad de Datos")
 
-        st.markdown("#### Indicadores de Consistencia y Unicidad")
-        st.write("**`sexo` - Unicidad de Categorías:**")
-        st.write(f"Original: {df_original['sexo'].value_counts(dropna=False).index.tolist()}")
-        st.write(f"Limpio: {df_cleaned['sexo'].value_counts(dropna=False).index.tolist()}")
-        st.markdown("""
-        **Observación:** Se espera que el número de categorías únicas y sus nombres se normalicen después de la limpieza (ej., solo 'Female', 'Male' y `None`).
-        """)
+    st.markdown("#### Comparación de Valores Faltantes (%)")
+    if not st.session_state['df_nulos_comp'].empty:
+        st.dataframe(st.session_state['df_nulos_comp'])
+        fig_nulos_comp = plot_missing_values_comparison(st.session_state['df_nulos_comp'])
+        st.plotly_chart(fig_nulos_comp, use_container_width=True)
+    else:
+        st.warning("Por favor, ejecuta la sección '2. Limpieza y Validación de Datos' primero para generar la comparación de nulos.")
+    
+    st.markdown("""
+    **Observaciones:**
+    * Se espera una **reducción significativa** en el porcentaje de nulos en **edad** si **fecha_nacimiento** estaba disponible y era válida.
+    * **fecha_nacimiento** puede mostrar un aumento de nulos si los formatos originales eran inválidos y se convirtieron a `NaT`.
+    * **telefono** puede tener nulos si quedaron cadenas vacías después de limpiar caracteres no numéricos.
+    * **sexo** podría tener nulos si había valores vacíos o no estandarizables.
+    """)
 
-        st.write("**`email` - Patrón de Formato (Conteo de Inválidos):**")
-        invalid_emails_original = df_original[~df_original['email'].astype(str).str.match(r'[^@]+@[^@]+\.[^@]+', na=False)]
-        invalid_emails_cleaned = df_cleaned[~df_cleaned['email'].astype(str).str.match(r'[^@]+@[^@]+\.[^@]+', na=False)]
-        st.write(f"Correos inválidos (Original): **{len(invalid_emails_original)}**")
-        st.write(f"Correos inválidos (Limpio): **{len(invalid_emails_cleaned)}**")
-        st.markdown("""
-        **Observación:** Aunque la limpieza no los altera, se validó su formato. Este indicador muestra si persisten correos con formato no estándar.
-        """)
+    st.markdown("#### Comparación de Tipos de Datos")
+    st.write("**Tipos de datos originales:**")
+    st.code(str({col: str(st.session_state['df_original'][col].dtype) for col in st.session_state['df_original'].columns}))
+    st.write("**Tipos de datos después de la limpieza:**")
+    st.code(str({col: str(st.session_state['df_cleaned'][col].dtype) for col in st.session_state['df_cleaned'].columns}))
+    st.markdown("""
+    **Observaciones:**
+    * **fecha_nacimiento** debería cambiar de `object` (cadena) a `datetime64[ns]` (tipo fecha y hora).
+    * **edad** debería cambiar de `object` (si contenía nulos o estaba mezclado) o `float64` (si se infirió numérico) a `Int64` (entero con soporte para nulos).
+    * **telefono** y **email** idealmente deberían permanecer como `object` (cadena) pero con formato validado.
+    """)
 
-        st.write("**`telefono` - Contiene solo dígitos (después de la limpieza):**")
-        non_numeric_phones_cleaned = df_cleaned[df_cleaned['telefono'].notna() & ~df_cleaned['telefono'].astype(str).str.isdigit()]
-        if not non_numeric_phones_cleaned.empty:
-            st.warning(f"Se encontraron **{len(non_numeric_phones_cleaned)}** registros con **números de teléfono que contienen caracteres no numéricos** después de la limpieza (esto no debería ocurrir si la limpieza fue efectiva).")
+    st.markdown("#### Indicadores de Consistencia y Unicidad")
+    st.write("**sexo - Unicidad de Categorías:**")
+    st.write(f"Original: {st.session_state['indicators_original'].get('sexo_unique_original', 'N/A')}")
+    st.write(f"Limpio: {st.session_state['indicators_cleaned'].get('sexo_unique_cleaned', 'N/A')}")
+    st.markdown("Observación: Se espera que el número de categorías únicas y sus nombres se normalicen después de la limpieza (ej., solo 'Female', 'Male' y `None`).")
+
+    st.write("**email - Patrón de Formato (Conteo de Inválidos):**")
+    st.write(f"Correos inválidos (Original): {st.session_state['indicators_original'].get('email_invalidos_original', 'N/A')}")
+    st.write(f"Correos inválidos (Limpio): {st.session_state['indicators_cleaned'].get('email_invalidos_limpio', 'N/A')}")
+    st.markdown("Observación: Aunque la limpieza no los altera, se validó su formato. Este indicador muestra si persisten correos con formato no estándar.")
+
+    st.write("**telefono - Contiene solo dígitos (después de la limpieza):**")
+    st.write(f"Todos los teléfonos contienen solo dígitos o son nulos después de la limpieza: {'Sí' if st.session_state['indicators_cleaned'].get('telefono_only_digits_cleaned', False) else 'No'}")
+
+
+    st.subheader("3.2. Documentación del Proceso")
+    st.markdown("""
+    #### Supuestos Adoptados Durante la Limpieza:
+    * **Fuente Única para Edad:** Se asume que `fecha_nacimiento` es la fuente más confiable para determinar la `edad`. Si `fecha_nacimiento` es válida, se **prioriza el cálculo de la edad a partir de ella** sobre el valor `edad` existente si este es nulo o inconsistente. La edad se calcula como la diferencia en años a la fecha actual, ajustando por mes y día.
+    * **Formato de `sexo`:** Se asume que los valores `Female`, `female`, `Male`, `male`, `F`, `f`, `M`, `m` y sus variaciones deben ser estandarizados a `Female` y `Male`. Cualquier otro valor (NaN, vacío, o no reconocido) se convierte a `None`.
+    * **Formato de `telefono`:** Se asume que los números de teléfono deben contener solo dígitos. Cualquier otro carácter (guiones, espacios, paréntesis, etc.) es **removido**. Las cadenas vacías o que solo consisten en espacios resultantes de esta limpieza se interpretan como nulas (None).
+    * **Coherencia de Fechas:** Se asume que las fechas de nacimiento no pueden ser en el futuro ni excesivamente antiguas (la edad se calcula en relación con la fecha actual y las edades negativas se descartan, convirtiéndolas a `None`).
+    * **ID de Paciente:** Se asume que `id_paciente` es el identificador **único** de cada paciente y no se espera que tenga problemas de calidad (duplicados, nulos).
+
+    #### Reglas de Validación Implementadas:
+    * **Validación de `fecha_nacimiento`:** Se verifica que la columna pueda ser convertida a tipo `datetime`. Los valores que no cumplen con este formato se marcan como `NaT` (Not a Time).
+    * **Validación de `edad`:**
+        * Debe ser un entero no negativo.
+        * Debe ser **consistente** con `fecha_nacimiento`: la `edad` calculada a partir de `fecha_nacimiento` debe ser cercana a la `edad` reportada (se permite una tolerancia de 1 año para posibles discrepancias de actualización de fechas en los datos originales).
+    * **Validación de `sexo`:** Los valores deben estar dentro de un conjunto predefinido de categorías estandarizadas (Female, `Male` o `None`).
+    * **Validación de `email`:** Se verifica que el formato siga una expresión regular básica (`[^@]+@[^@]+\.[^@]+`) para asegurar que contenga un `@` y al menos un `.` en el dominio. Esta es una validación de patrón, no de existencia.
+    * **Validación de `telefono`:** Se verifica que, después de la limpieza, la columna contenga solo caracteres numéricos (o sea nula).
+
+    #### Recomendaciones de Mejora para Asegurar la Calidad Futura de los Datos:
+    * **Validación en Origen:** Implementar validaciones a nivel de entrada de datos (ej., formularios web, bases de datos) para `fecha_nacimiento`, `sexo`, `email` y `telefono`.
+        * `fecha_nacimiento`: Usar selectores de fecha para prevenir entradas manuales erróneas y asegurar formato `AAAA-MM-DD`.
+        * `sexo`: Usar listas desplegables con opciones predefinidas (Female, Male) para evitar inconsistencias de capitalización o errores tipográficos.
+        * `email`: Implementar validación de formato de correo electrónico en tiempo real en la entrada de datos y, si es posible, una verificación de dominio.
+        * `telefono`: Forzar la entrada de solo dígitos o un formato específico (ej., con máscaras de entrada) dependiendo del país, y validar longitud mínima/máxima.
+    * **Estandarización de `ciudad`:** Implementar un catálogo o lista maestra de ciudades/municipios para asegurar consistencia y evitar variaciones en los nombres de ciudades (ej., "Barranquilla" vs "barranquilla", o errores tipográficos).
+    * **Definición de Campos Obligatorios:** Establecer claramente qué campos son obligatorios (ej., `id_paciente`, `nombre`, `fecha_nacimiento`, `sexo`) en la base de datos o sistema de entrada para reducir la aparición de valores nulos críticos.
+    * **Auditorías Regulares de Datos:** Realizar auditorías periódicas de la base de datos para identificar nuevos patrones de error o degradación de la calidad de los datos con el tiempo.
+    * **Documentación de Metadatos:** Mantener un **diccionario de datos** actualizado que defina claramente cada campo, su tipo de dato esperado, formato, reglas de validación y significado, accesible para todo el equipo.
+    * **Sistema de Reporte de Errores:** Establecer un mecanismo para que los usuarios (personal del hospital, médicos) reporten inconsistencias o errores en los datos cuando los detecten, con un flujo claro para su corrección.
+    * **Capacitación del Personal:** Asegurar que el personal encargado de la entrada de datos esté continuamente capacitado en las mejores prácticas de entrada de datos y comprenda la importancia de la calidad de los datos para la toma de decisiones y la atención al paciente.
+    """)
+
+    st.subheader("3.3. Bonus (Opcional)")
+    st.markdown("""
+    #### Implementación de Pruebas Automáticas
+    Para implementar pruebas automáticas para la calidad de los datos, se podrían usar frameworks como **Pytest** o **Great Expectations**.
+
+    **Ejemplo conceptual con Pytest** (en un archivo `tests/test_data_quality.py`):
+    ```python
+    # Este código es conceptual y no forma parte de app.py
+    # Deberías tener tus funciones de limpieza y validación en un módulo separado para importarlas aquí.
+    import pandas as pd
+    import pytest
+    from datetime import date, datetime
+
+    # from your_project.data_quality_functions import clean_patient_data, calculate_age_from_dob # Ejemplo de importación
+
+    # Asegúrate de que calculate_age_from_dob sea accesible si no la importas desde un módulo
+    def calculate_age_from_dob(row_dob, current_date):
+        if pd.isna(row_dob):
+            return None
         else:
-            st.success("Todos los teléfonos contienen solo dígitos o son nulos después de la limpieza.")
-
-        st.subheader("3.2. Documentación del Proceso")
-
-        st.markdown("### **Supuestos Adoptados Durante la Limpieza:**")
-        st.markdown("""
-        * **Fuente Única para Edad:** Se asume que `fecha_nacimiento` es la fuente más confiable para determinar la `edad`. Si `fecha_nacimiento` es válida, se **prioriza el cálculo de la edad a partir de ella** sobre el valor `edad` existente si este es nulo o inconsistente. La edad se calcula como la diferencia en años a la fecha actual, ajustando por mes y día.
-        * **Formato de `sexo`:** Se asume que los valores `Female`, `female`, `Male`, `male`, `F`, `f`, `M`, `m` y sus variaciones deben ser estandarizados a **`Female`** y **`Male`**. Cualquier otro valor (`NaN`, vacío, o no reconocido) se convierte a `None`.
-        * **Formato de `telefono`:** Se asume que los números de teléfono deben contener solo dígitos. Cualquier otro carácter (guiones, espacios, paréntesis, etc.) es **removido**. Las cadenas vacías o que solo consisten en espacios resultantes de esta limpieza se interpretan como nulas (`None`).
-        * **Coherencia de Fechas:** Se asume que las fechas de nacimiento no pueden ser en el futuro ni excesivamente antiguas (la edad se calcula en relación con la fecha actual y las edades negativas se descartan, convirtiéndolas a `None`).
-        * **ID de Paciente:** Se asume que `id_paciente` es el identificador **único** de cada paciente y no se espera que tenga problemas de calidad (duplicados, nulos).
-        """)
-
-        st.markdown("### **Reglas de Validación Implementadas:**")
-        st.markdown("""
-        * **Validación de `fecha_nacimiento`:** Se verifica que la columna pueda ser convertida a tipo `datetime`. Los valores que no cumplen con este formato se marcan como `NaT` (Not a Time).
-        * **Validación de `edad`:**
-            * Debe ser un entero no negativo.
-            * Debe ser **consistente** con `fecha_nacimiento`: la `edad` calculada a partir de `fecha_nacimiento` debe ser cercana a la `edad` reportada (se permite una tolerancia de 1 año para posibles discrepancias de actualización de fechas en los datos originales).
-        * **Validación de `sexo`:** Los valores deben estar dentro de un conjunto predefinido de categorías estandarizadas (`Female`, `Male` o `None`).
-        * **Validación de `email`:** Se verifica que el formato siga una expresión regular básica (`[^@]+@[^@]+\.[^@]+`) para asegurar que contenga un `@` y al menos un `.` en el dominio. Esta es una validación de patrón, no de existencia.
-        * **Validación de `telefono`:** Se verifica que, después de la limpieza, la columna contenga solo caracteres numéricos (o sea nula).
-        """)
-
-        st.markdown("### **Recomendaciones de Mejora para Asegurar la Calidad Futura de los Datos:**")
-        st.markdown("""
-        1.  **Validación en Origen:** Implementar validaciones a nivel de entrada de datos (ej., formularios web, bases de datos) para `fecha_nacimiento`, `sexo`, `email` y `telefono`.
-            * **`fecha_nacimiento`:** Usar selectores de fecha para prevenir entradas manuales erróneas y asegurar formato `AAAA-MM-DD`.
-            * **`sexo`:** Usar listas desplegables con opciones predefinidas (`Female`, `Male`) para evitar inconsistencias de capitalización o errores tipográficos.
-            * **`email`:** Implementar validación de formato de correo electrónico en tiempo real en la entrada de datos y, si es posible, una verificación de dominio.
-            * **`telefono`:** Forzar la entrada de solo dígitos o un formato específico (ej., con máscaras de entrada) dependiendo del país, y validar longitud mínima/máxima.
-        2.  **Estandarización de `ciudad`:** Implementar un catálogo o lista maestra de ciudades/municipios para asegurar consistencia y evitar variaciones en los nombres de ciudades (ej., "Barranquilla" vs "barranquilla", o errores tipográficos).
-        3.  **Definición de Campos Obligatorios:** Establecer claramente qué campos son obligatorios (ej., `id_paciente`, `nombre`, `fecha_nacimiento`, `sexo`) en la base de datos o sistema de entrada para reducir la aparición de valores nulos críticos.
-        4.  **Auditorías Regulares de Datos:** Realizar auditorías periódicas de la base de datos para identificar nuevos patrones de error o degradación de la calidad de los datos con el tiempo.
-        5.  **Documentación de Metadatos:** Mantener un `diccionario de datos` actualizado que defina claramente cada campo, su tipo de dato esperado, formato, reglas de validación y significado, accesible para todo el equipo.
-        6.  **Sistema de Reporte de Errores:** Establecer un mecanismo para que los usuarios (personal del hospital, médicos) reporten inconsistencias o errores en los datos cuando los detecten, con un flujo claro para su corrección.
-        7.  **Capacitación del Personal:** Asegurar que el personal encargado de la entrada de datos esté continuamente capacitado en las mejores prácticas de entrada de datos y comprenda la importancia de la calidad de los datos para la toma de decisiones y la atención al paciente.
-        """)
-
-        st.subheader("3.3. Bonus (Opcional)")
-        st.markdown("""
-        #### Implementación de Pruebas Automáticas
-        Para implementar pruebas automáticas para la calidad de los datos, se podrían usar frameworks como **Pytest** o **Great Expectations**.
-
-        **Ejemplo conceptual con Pytest (en un archivo `tests/test_data_quality.py`):**
-        ```python
-        # Este código es conceptual y no forma parte de app.py
-        # Deberías tener tus funciones de limpieza y validación en un módulo separado para importarlas aquí.
-        import pandas as pd
-        import pytest
-        from datetime import date, datetime
-        # from your_project.data_quality_functions import clean_patient_data, calculate_age_from_dob # Ejemplo de importación
-
-        # Asegúrate de que calculate_age_from_dob sea accesible si no la importas desde un módulo
-        def calculate_age_from_dob(row_dob, current_date):
-            if pd.isna(row_dob):
-                return None
-            else:
-                if isinstance(row_dob, str):
-                    try:
-                        row_dob = datetime.strptime(row_dob, '%Y-%m-%d').date()
-                    except ValueError:
-                        return None
-                elif isinstance(row_dob, pd.Timestamp):
-                    row_dob = row_dob.date()
-
-                age = current_date.year - row_dob.year - ((current_date.month, current_date.day) < (row_dob.month, row_dob.day))
-                return age if age >= 0 else None
-
-        @pytest.fixture
-        def sample_patient_data():
-            # Datos de prueba con casos conocidos para verificar la limpieza
-            data = {
-                "pacientes": [
-                    {"id_paciente": 1, "nombre": "Claudia Torres", "fecha_nacimiento": "1954-01-08", "edad": None, "sexo": "Female", "email": "user1@example.com", "telefono": "342-950-1064", "ciudad": "Barranquilla"},
-                    {"id_paciente": 2, "nombre": "Pedro Gomez", "fecha_nacimiento": "1980-05-15", "edad": 40, "sexo": "male", "email": "pedro@example", "telefono": "123-ABC-456", "ciudad": "Medellin"},
-                    {"id_paciente": 3, "nombre": "Ana Smith", "fecha_nacimiento": "2025-01-01", "edad": 5, "sexo": "FEMALE", "email": "ana@example.com", "telefono": "7891234567", "ciudad": "Bogota"}, # Fecha futura, edad incorrecta
-                    {"id_paciente": 4, "nombre": "Luis Lopez", "fecha_nacimiento": "1990-11-20", "edad": None, "sexo": "Male", "email": "luis.lopez@example.com", "telefono": "9876543210", "ciudad": "Cali"},
-                    {"id_paciente": 5, "nombre": "Maria Paz", "fecha_nacimiento": None, "edad": 30, "sexo": "Female", "email": "maria@example.net", "telefono": "300-111-2222", "ciudad": "Bogota"},
-                    {"id_paciente": 6, "nombre": "Carlos", "fecha_nacimiento": "1970-07-08", "edad": 50, "sexo": "OTHER", "email": "carlos@example.com", "telefono": "123-456-7890", "ciudad": "Cartagena"},
-                    {"id_paciente": 7, "nombre": "Laura", "fecha_nacimiento": "1995-03-20", "edad": None, "sexo": "F", "email": "laura@example.com", "telefono": "1112223333", "ciudad": "Bucaramanga"}, # Prueba de 'F'
-                    {"id_paciente": 8, "nombre": "Diego", "fecha_nacimiento": "1988-09-10", "edad": None, "sexo": "m", "email": "diego@example.com", "telefono": "4445556666", "ciudad": "Cali"} # Prueba de 'm'
-                ]
-            }
-            return pd.json_normalize(data['pacientes'])
-
-        # Esta sería la función de limpieza que probarías, adaptada de tu app.py
-        def clean_patient_data_for_test(df_raw):
-            df_cleaned_test = df_raw.copy()
-            current_date_for_test = date(2025, 7, 9) # Fecha fija para las pruebas de edad
-
-            # Sexo
-            df_cleaned_test['sexo'] = df_cleaned_test['sexo'].astype(str).str.lower()
-            sex_mapping = {
-                'f': 'Female',
-                'female': 'Female',
-                'm': 'Male',
-                'male': 'Male'
-            }
-            df_cleaned_test['sexo'] = df_cleaned_test['sexo'].map(sex_mapping)
-            df_cleaned_test.loc[df_cleaned_test['sexo'].isna(), 'sexo'] = None
-
-
-            # Fecha Nacimiento y Edad
-            df_cleaned_test['fecha_nacimiento'] = pd.to_datetime(df_cleaned_test['fecha_nacimiento'], errors='coerce')
-            df_cleaned_test['edad_calculada_test'] = df_cleaned_test['fecha_nacimiento'].apply(lambda dob: calculate_age_from_dob(dob, current_date_for_test))
-            df_cleaned_test['edad'] = df_cleaned_test.apply(
-                lambda row: row['edad_calculada_test'] if pd.notna(row['edad_calculada_test']) else row['edad'], axis=1
-            )
-            df_cleaned_test['edad'] = df_cleaned_test['edad'].astype('Int64')
-            df_cleaned_test = df_cleaned_test.drop(columns=['edad_calculada_test'])
-
-            # Telefono
-            df_cleaned_test['telefono'] = df_cleaned_test['telefono'].astype(str).str.replace(r'[^0-9]', '', regex=True)
-            df_cleaned_test.loc[df_cleaned_test['telefono'].str.strip() == '', 'telefono'] = None
-
-            return df_cleaned_test
-
-        def test_sexo_standardization(sample_patient_data):
-            df_cleaned = clean_patient_data_for_test(sample_patient_data)
-            assert all(s in ['Female', 'Male', None] for s in df_cleaned['sexo'].unique()), "Los valores de sexo no están estandarizados o contienen inesperados."
-            assert pd.isna(df_cleaned.loc[df_cleaned['id_paciente'] == 6, 'sexo'].iloc[0]), "El valor 'OTHER' para sexo no se convirtió a None."
-            assert df_cleaned.loc[df_cleaned['id_paciente'] == 7, 'sexo'].iloc[0] == 'Female', "El valor 'F' para sexo no se convirtió a 'Female'."
-            assert df_cleaned.loc[df_cleaned['id_paciente'] == 8, 'sexo'].iloc[0] == 'Male', "El valor 'm' para sexo no se convirtió a 'Male'."
-
-
-        def test_age_calculation_and_validation(sample_patient_data):
-            df_cleaned = clean_patient_data_for_test(sample_patient_data)
-            assert all(df_cleaned['edad'].dropna() >= 0), "Las edades calculadas no deben ser negativas."
-            # Verificar edad para id_paciente 1 (1954-01-08) -> 2025-1954 = 71
-            assert df_cleaned.loc[df_cleaned['id_paciente'] == 1, 'edad'].iloc[0] == 71, "La edad para el paciente 1 no se calculo correctamente."
-            # Verificar que la fecha futura (2025-01-01) resulta en edad nula/None
-            assert pd.isna(df_cleaned.loc[df_cleaned['id_paciente'] == 3, 'edad'].iloc[0]), "La edad para fecha futura deberia ser nula."
-            # Verificar que si fecha_nacimiento es nulo pero la edad existe, se mantiene (id_paciente 5)
-            assert df_cleaned.loc[df_cleaned['id_paciente'] == 5, 'edad'].iloc[0] == 30, "La edad para el paciente 5 no se mantuvo correctamente."
-
-
-        def test_email_format_after_cleaning(sample_patient_data):
-            df_cleaned = clean_patient_data_for_test(sample_patient_data) # No hay limpieza directa de email, solo validación
-            invalid_emails_in_cleaned = df_cleaned[~df_cleaned['email'].astype(str).str.match(r'[^@]+@[^@]+\.[^@]+', na=False)]
-            # Esperamos que 'pedro@example' siga siendo inválido
-            assert 'pedro@example' in invalid_emails_in_cleaned['email'].values, "El email 'pedro@example' no se marco como invalido."
-            # No esperamos que se añadan nuevos invalidos, y su numero debe ser consistente con los originales
-            assert len(invalid_emails_in_cleaned) == 1, "Se detecto un numero inesperado de correos electronicos invalidos."
-
-
-        def test_telefono_numeric_after_cleaning(sample_patient_data):
-            df_cleaned = clean_patient_data_for_test(sample_patient_data)
-            assert all(df_cleaned['telefono'].dropna().apply(lambda x: x.isdigit())), "El campo telefono contiene caracteres no numericos despues de la limpieza."
-            assert pd.isna(df_cleaned.loc[df_cleaned['id_paciente'] == 2, 'telefono'].iloc[0]), "El telefono con caracteres no numericos no se limpio correctamente."
-        ```
-        Para ejecutar Pytest, necesitas:
-        1.  `pytest` instalado: `pip install pytest`
-        2.  Guardar el código de prueba en un archivo como `tests/test_data_quality.py` (o similar) en una carpeta `tests/`.
-        3.  **Importante:** Refactorizar tus funciones de limpieza y validación de `app.py` en un módulo de Python separado (ej., `procesamiento_datos.py`) para que puedas importarlas en las pruebas. O, para esta demostración, puedes copiar y adaptar las funciones de limpieza dentro del propio archivo de prueba como se muestra arriba.
-        4.  Ejecutar `pytest` en tu terminal desde la raíz de tu proyecto.
-
-        #### Simulación de Migración de Datos Limpios a una Estructura Objetivo
-        Una vez que los datos han sido limpiados y validados, el siguiente paso lógico en una tubería de datos es cargarlos en una estructura objetivo, como un Data Warehouse o una base de datos analítica. Formatos como **Parquet** son ideales para esto debido a su naturaleza columnar, compresión eficiente y capacidad para manejar esquemas complejos.
-
-        Aquí simulamos la descarga de los datos limpios en formatos comunes para la migración.
-        """)
-
-        # Código para el bonus de descarga
-        if 'df_cleaned' in st.session_state:
-            st.markdown("#### Simulación de Migración de Datos Limpios")
-
-            @st.cache_data
-            def convert_df_to_csv(df):
-                return df.to_csv(index=False).encode('utf-8')
-
-            @st.cache_data
-            def convert_df_to_parquet(df):
+            if isinstance(row_dob, str):
                 try:
-                    import pyarrow # Asegúrate de que pyarrow esté instalado para to_parquet
-                    return df.to_parquet(index=False)
-                except ImportError:
-                    st.error("Para descargar en formato Parquet, instala 'pyarrow': `pip install pyarrow`")
+                    row_dob = datetime.strptime(row_dob, '%Y-%m-%d').date()
+                except ValueError:
                     return None
-                except Exception as e:
-                    st.error(f"Error al generar el archivo Parquet: {e}")
-                    return None
+            elif isinstance(row_dob, pd.Timestamp):
+                row_dob = row_dob.date()
+            age = current_date.year - row_dob.year - ((current_date.month, current_date.day) < (row_dob.month, row_dob.day))
+            return age if age >= 0 else None
 
-            col_csv, col_parquet = st.columns(2)
-            with col_csv:
-                st.download_button(
-                    label="Descargar Datos Limpios (CSV)",
-                    data=convert_df_to_csv(st.session_state['df_cleaned']),
-                    file_name="pacientes_limpios.csv",
-                    mime="text/csv",
-                    key="download_csv"
-                )
-            with col_parquet:
-                parquet_data = convert_df_to_parquet(st.session_state['df_cleaned'])
-                if parquet_data is not None: # Solo mostrar el botón si los datos parquet se generaron con éxito
-                    st.download_button(
-                        label="Descargar Datos Limpios (Parquet)",
-                        data=parquet_data,
-                        file_name="pacientes_limpios.parquet",
-                        mime="application/octet-stream",
-                        key="download_parquet"
-                    )
+    @pytest.fixture
+    def sample_patient_data():
+        # Datos de prueba con casos conocidos para verificar la limpieza
+        data = {
+            "pacientes": [
+                {"id_paciente": 1, "nombre": "Claudia Torres", "fecha_nacimiento": "1954-01-08", "edad": None, "sexo": "Female", "email": "user1@example.com", "telefono": "342-950-1064", "ciudad": "Barranquilla"},
+                {"id_paciente": 2, "nombre": "Pedro Gomez", "fecha_nacimiento": "1980-05-15", "edad": 40, "sexo": "male", "email": "pedro@example", "telefono": "123-ABC-456", "ciudad": "Medellin"},
+                {"id_paciente": 3, "nombre": "Ana Smith", "fecha_nacimiento": "2025-01-01", "edad": 5, "sexo": "FEMALE", "email": "ana@example.com", "telefono": "7891234567", "ciudad": "Bogota"}, # Fecha futura, edad incorrecta
+                {"id_paciente": 4, "nombre": "Luis Lopez", "fecha_nacimiento": "1990-11-20", "edad": None, "sexo": "Male", "email": "luis.lopez@example.com", "telefono": "9876543210", "ciudad": "Cali"},
+                {"id_paciente": 5, "nombre": "Maria Paz", "fecha_nacimiento": None, "edad": 30, "sexo": "Female", "email": "maria@example.net", "telefono": "300-111-2222", "ciudad": "Bogota"},
+                {"id_paciente": 6, "nombre": "Carlos", "fecha_nacimiento": "1970-07-08", "edad": 50, "sexo": "OTHER", "email": "carlos@example.com", "telefono": "123-456-7890", "ciudad": "Cartagena"},
+                {"id_paciente": 7, "nombre": "Laura", "fecha_nacimiento": "1995-03-20", "edad": None, "sexo": "F", "email": "laura@example.com", "telefono": "1112223333", "ciudad": "Bucaramanga"}, # Prueba de 'F'
+                {"id_paciente": 8, "nombre": "Diego", "fecha_nacimiento": "1988-09-10", "edad": None, "sexo": "m", "email": "diego@example.com", "telefono": "4445556666", "ciudad": "Cali"} # Prueba de 'm'
+            ]
+        }
+        return pd.json_normalize(data['pacientes'])
 
-            st.markdown("""
-            **Justificación de la Migración:**
-            La migración de datos limpios a un Data Warehouse (DW) típicamente implica:
-            1.  **Extract (Extraer):** Obtener datos de las fuentes.
-            2.  **Transform (Transformar):** Los datos son limpiados, estandarizados, validados y preparados para ajustarse al esquema del DW. Esta es la fase que hemos detallado en esta aplicación.
-            3.  **Load (Cargar):** Los datos transformados se cargan en las tablas dimensionales y de hechos del DW.
-            Los formatos como CSV son universales, pero Parquet es preferido en entornos de Big Data y DW por su eficiencia. La simulación de descarga CSV/Parquet representa la salida de este proceso de transformación, lista para ser cargada en un sistema optimizado para consultas analíticas.
-            """)
+    # Esta sería la función de limpieza que probarías, adaptada de tu app.py
+    def clean_patient_data_for_test(df_raw):
+        df_cleaned_test = df_raw.copy()
+        current_date_for_test = date(2025, 7, 9) # Fecha fija para las pruebas de edad
 
-            # --- NUEVA FUNCIONALIDAD: Descarga de Informes Automatizados (HTML) ---
-            st.markdown("---")
-            st.subheader("3.4. Generar Informe Completo")
-            st.markdown("Descarga un informe HTML con un resumen de los indicadores de calidad, EDA y resultados del clustering.")
+        # Sexo
+        df_cleaned_test['sexo'] = df_cleaned_test['sexo'].astype(str).str.lower()
+        sex_mapping = {
+            'f': 'Female',
+            'female': 'Female',
+            'm': 'Male',
+            'male': 'Male'
+        }
+        df_cleaned_test['sexo'] = df_cleaned_test['sexo'].map(sex_mapping)
+        df_cleaned_test.loc[df_cleaned_test['sexo'].isna(), 'sexo'] = None
 
-            # Función para generar el informe HTML
-            def generate_html_report(df_cleaned, indicators_original, indicators_cleaned, kpis, eda_plots, cluster_results):
-                html_content = """
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>Informe de Calidad y Análisis de Datos de Pacientes</title>
-                    <style>
-                        body { font-family: sans-serif; margin: 20px; line-height: 1.6; color: #333; }
-                        h1, h2, h3, h4 { color: #2C3E50; margin-top: 25px; margin-bottom: 10px; }
-                        h1 { font-size: 2em; text-align: center; color: #1A5276; }
-                        h2 { font-size: 1.6em; border-bottom: 2px solid #ddd; padding-bottom: 5px; }
-                        h3 { font-size: 1.3em; color: #34495E; }
-                        h4 { font-size: 1.1em; color: #5D6D7E; }
-                        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
-                        th, td { border: 1px solid #ddd; padding: 10px; text-align: left; vertical-align: top; }
-                        th { background-color: #ECF0F1; font-weight: bold; }
-                        tr:nth-child(even) { background-color: #F8F9F9; }
-                        .section { margin-bottom: 40px; padding: 15px; border-radius: 8px; background-color: #FFFFFF; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-                        .plot-container { text-align: center; margin-bottom: 30px; padding: 15px; background-color: #FDFEFE; border-radius: 8px; border: 1px solid #eee; }
-                        img { max-width: 90%; height: auto; display: block; margin: 0 auto; border: 1px solid #ccc; border-radius: 4px; }
-                        pre { background-color: #eee; padding: 10px; border-radius: 5px; overflow-x: auto; }
-                        ul { list-style-type: disc; margin-left: 20px; }
-                        strong { color: #2C3E50; }
-                    </style>
-                </head>
-                <body>
-                    <h1>Informe de Calidad y Análisis de Datos de Pacientes</h1>
-                    <p style="text-align: center; color: #7F8C8D;">Generado el: {date_generated}</p>
+        # Fecha Nacimiento y Edad
+        df_cleaned_test['fecha_nacimiento'] = pd.to_datetime(df_cleaned_test['fecha_nacimiento'], errors='coerce')
+        df_cleaned_test['edad_calculada_test'] = df_cleaned_test['fecha_nacimiento'].apply(lambda dob: calculate_age_from_dob(dob, current_date_for_test))
+        df_cleaned_test['edad'] = df_cleaned_test.apply(
+            lambda row: row['edad_calculada_test'] if pd.notna(row['edad_calculada_test']) else row['edad'], axis=1
+        )
+        df_cleaned_test['edad'] = df_cleaned_test['edad'].astype('Int64')
+        df_cleaned_test = df_cleaned_test.drop(columns=['edad_calculada_test'])
 
-                    <div class="section">
-                        <h2>1. Resumen de Calidad de Datos</h2>
-                        <h3>1.1. Comparación de Valores Faltantes (%)</h3>
-                        {nulos_df_html}
-                        <h3>1.2. Comparación de Tipos de Datos</h3>
-                        <h4>Tipos de Datos Originales</h4>
-                        <pre>{original_types}</pre>
-                        <h4>Tipos de Datos Después de la Limpieza</h4>
-                        <pre>{cleaned_types}</pre>
-                        <h3>1.3. Indicadores de Consistencia y Unicidad</h3>
-                        <p><strong>`sexo` - Unicidad de Categorías (Original):</strong> {sex_original_unique}</p>
-                        <p><strong>`sexo` - Unicidad de Categorías (Limpio):</strong> {sex_cleaned_unique}</p>
-                        <p><strong>`email` - Correos Inválidos (Original):</strong> {invalid_emails_original}</p>
-                        <p><strong>`email` - Correos Inválidos (Limpio):</strong> {invalid_emails_cleaned}</p>
-                    </div>
+        # Telefono
+        df_cleaned_test['telefono'] = df_cleaned_test['telefono'].astype(str).str.replace(r'[^0-9]', '', regex=True)
+        df_cleaned_test.loc[df_cleaned_test['telefono'].str.strip() == '', 'telefono'] = None
+        return df_cleaned_test
 
-                    <div class="section">
-                        <h2>2. EDA Avanzado y Métricas Clave</h2>
-                        <h3>2.1. Métricas Clave (KPIs)</h3>
-                        <ul>
-                            <li><strong>Total de Pacientes:</strong> {total_patients}</li>
-                            <li><strong>Edad Promedio:</strong> {avg_age:.1f}</li>
-                            <li><strong>Ciudad Más Común:</strong> {most_common_city}</li>
-                        </ul>
-                        <h3>2.2. Visualizaciones</h3>
-                        {eda_plots_html}
-                    </div>
+    def test_sexo_standardization(sample_patient_data):
+        df_cleaned = clean_patient_data_for_test(sample_patient_data)
+        assert all(s in ['Female', 'Male', None] for s in df_cleaned['sexo'].unique()), "Los valores de sexo no están estandarizados o contienen inesperados."
+        assert pd.isna(df_cleaned.loc[df_cleaned['id_paciente'] == 6, 'sexo'].iloc[0]), "El valor 'OTHER' para sexo no se convirtió a None."
+        assert df_cleaned.loc[df_cleaned['id_paciente'] == 7, 'sexo'].iloc[0] == 'Female', "El valor 'F' para sexo no se convirtió a 'Female'."
+        assert df_cleaned.loc[df_cleaned['id_paciente'] == 8, 'sexo'].iloc[0] == 'Male', "El valor 'm' para sexo no se convirtió a 'Male'."
 
-                    <div class="section">
-                        <h2>3. Resultados del Agrupamiento (Clustering)</h2>
-                        <h3>3.1. Características Promedio por Cluster</h3>
-                        {cluster_centers_html}
-                        <h3>3.2. Conteo de Pacientes por Cluster</h3>
-                        {cluster_counts_html}
-                        <h3>3.3. Visualización de Clusters</h3>
-                        {cluster_plots_html}
-                        <h4>Métricas de Evaluación del Clustering:</h4>
-                        <ul>
-                            <li><strong>Número de Clusters:</strong> {n_clusters_value}</li>
-                            <li><strong>Silhouette Score:</strong> {silhouette_score_value:.2f}</li>
-                            <li><strong>Davies-Bouldin Index:</strong> {davies_bouldin_index_value:.2f}</li>
-                            <li><strong>Calinski-Harabasz Index:</strong> {calinski_harabasz_index_value:.2f}</li>
-                            <li><strong>Inercia (SSE):</strong> {inertia_value:.2f}</li>
-                        </ul>
-                    </div>
+    def test_age_calculation_and_validation(sample_patient_data):
+        df_cleaned = clean_patient_data_for_test(sample_patient_data)
+        assert all(df_cleaned['edad'].dropna() >= 0), "Las edades calculadas no deben ser negativas."
+        # Verificar edad para id_paciente 1 (1954-01-08) -> 2025-1954 = 71
+        assert df_cleaned.loc[df_cleaned['id_paciente'] == 1, 'edad'].iloc[0] == 71, "La edad para el paciente 1 no se calculo correctamente."
+        # Verificar que la fecha futura (2025-01-01) resulta en edad nula/None
+        assert pd.isna(df_cleaned.loc[df_cleaned['id_paciente'] == 3, 'edad'].iloc[0]), "La edad para fecha futura deberia ser nula."
+        # Verificar que si fecha_nacimiento es nulo pero la edad existe, se mantiene (id_paciente 5)
+        assert df_cleaned.loc[df_cleaned['id_paciente'] == 5, 'edad'].iloc[0] == 30, "La edad para el paciente 5 no se mantuvo correctamente."
 
-                </body>
-                </html>
-                """.format(
-                    date_generated=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    nulos_df_html=st.session_state['df_nulos_comp'].to_html(index=True) if not st.session_state['df_nulos_comp'].empty else "<p>No hay datos de comparación de nulos.</p>",
-                    original_types=str(indicators_original.get('Tipos de Datos por Columna', {})),
-                    cleaned_types=str(indicators_cleaned.get('Tipos de Datos por Columna', {})),
-                    sex_original_unique=str(df_original['sexo'].value_counts(dropna=False).index.tolist()),
-                    sex_cleaned_unique=str(df_cleaned['sexo'].value_counts(dropna=False).index.tolist()),
-                    invalid_emails_original=len(df_original[~df_original['email'].astype(str).str.match(r'[^@]+@[^@]+\.[^@]+', na=False)]),
-                    invalid_emails_cleaned=len(df_cleaned[~df_cleaned['email'].astype(str).str.match(r'[^@]+@[^@]+\.[^@]+', na=False)]),
-                    total_patients=kpis.get('num_patients', 'N/A'),
-                    avg_age=kpis.get('avg_age', np.nan) if pd.notna(kpis.get('avg_age', np.nan)) else 'N/A',
-                    most_common_city=kpis.get('most_common_city', 'N/A'),
-                    eda_plots_html="".join([f'<div class="plot-container"><h4>{title}</h4><img src="data:image/png;base64,{img_data}" /></div>' for title, img_data in eda_plots]) if eda_plots else "<p>No hay visualizaciones de EDA disponibles. Ejecuta la sección 'EDA Avanzado' para generarlas.</p>",
-                    cluster_centers_html=cluster_results['cluster_centers_df'].to_html(index=True) if not cluster_results['cluster_centers_df'].empty else "<p>No hay datos de centros de cluster. Ejecuta la sección de 'Modelado ML' para generarlos.</p>",
-                    cluster_counts_html=cluster_results['cluster_counts_df'].to_html(index=True) if not cluster_results['cluster_counts_df'].empty else "<p>No hay datos de conteo por cluster. Ejecuta la sección de 'Modelado ML' para generarlos.</p>",
-                    cluster_plots_html="".join([f'<div class="plot-container"><h4>{title}</h4><img src="data:image/png;base64,{img_data}" /></div>' for title, img_data in cluster_results['cluster_plots_data']]) if cluster_results['cluster_plots_data'] else "<p>No hay visualizaciones de clusters disponibles. Ejecuta la sección de 'Modelado ML' para generarlas.</p>",
-                    n_clusters_value=cluster_results.get('n_clusters', 'N/A'),
-                    silhouette_score_value=cluster_results.get('silhouette_score', np.nan),
-                    davies_bouldin_index_value=cluster_results.get('davies_bouldin_index', np.nan),
-                    calinski_harabasz_index_value=cluster_results.get('calinski_harabasz_index', np.nan),
-                    inertia_value=cluster_results.get('inertia', np.nan)
-                )
-                return html_content
+    def test_email_format_after_cleaning(sample_patient_data):
+        df_cleaned = clean_patient_data_for_test(sample_patient_data) # No hay limpieza directa de email, solo validación
+        invalid_emails_in_cleaned = df_cleaned[~df_cleaned['email'].astype(str).str.match(r'[^@]+@[^@]+\.[^@]+', na=False)]
+        # Esperamos que 'pedro@example' siga siendo inválido
+        assert 'pedro@example' in invalid_emails_in_cleaned['email'].values, "El email 'pedro@example' no se marco como invalido."
+        # No esperamos que se añadan nuevos invalidos, y su numero debe ser consistente con los originales
+        assert len(invalid_emails_in_cleaned) == 1, "Se detecto un numero inesperado de correos electronicos invalidos."
 
+    def test_telefono_numeric_after_cleaning(sample_patient_data):
+        df_cleaned = clean_patient_data_for_test(sample_patient_data)
+        assert all(df_cleaned['telefono'].dropna().apply(lambda x: x.isdigit())), "El campo telefono contiene caracteres no numericos despues de la limpieza."
+        assert pd.isna(df_cleaned.loc[df_cleaned['id_paciente'] == 2, 'telefono'].iloc[0]), "El telefono con caracteres no numericos no se limpio correctamente."
+    ```
+    Para ejecutar Pytest, necesitas:
+    * `pytest` instalado: `pip install pytest`
+    * Guardar el código de prueba en un archivo como `tests/test_data_quality.py` (o similar) en una carpeta `tests/`.
+    * **Importante:** Refactorizar tus funciones de limpieza y validación de `app.py` en un módulo de Python separado (ej., `procesamiento_datos.py`) para que puedas importarlas en las pruebas. O, para esta demostración, puedes copiar y adaptar las funciones de limpieza dentro del propio archivo de prueba como se muestra arriba.
+    * Ejecutar `pytest` en tu terminal desde la raíz de tu proyecto.
+
+    #### Simulación de Migración de Datos Limpios a una Estructura Objetivo
+    Una vez que los datos han sido limpiados y validados, el siguiente paso lógico en una tubería de datos es cargarlos en una estructura objetivo, como un Data Warehouse o una base de datos analítica. Formatos como **Parquet** son ideales para esto debido a su naturaleza columnar, compresión eficiente y capacidad para manejar esquemas complejos.
+
+    Aquí simulamos la descarga de los datos limpios en formatos comunes para la migración.
+    """)
+
+    st.subheader("Simulación de Migración de Datos Limpios")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        csv_buffer = StringIO()
+        st.session_state['df_cleaned'].to_csv(csv_buffer, index=False)
+        st.download_button(
+            label="Descargar CSV Limpio",
+            data=csv_buffer.getvalue(),
+            file_name="pacientes_limpio.csv",
+            mime="text/csv",
+            help="Descarga el DataFrame limpio en formato CSV."
+        )
+
+    with col2:
+        try:
+            # Para Parquet, es mejor usar un buffer de Bytes
+            parquet_buffer = io.BytesIO()
+            st.session_state['df_cleaned'].to_parquet(parquet_buffer, index=False)
+            st.download_button(
+                label="Descargar Parquet Limpio",
+                data=parquet_buffer.getvalue(),
+                file_name="pacientes_limpio.parquet",
+                mime="application/octet-stream",
+                help="Descarga el DataFrame limpio en formato Parquet (eficiente para Big Data)."
+            )
+        except Exception as e:
+            st.warning(f"Error al generar archivo Parquet: {e}. Asegúrate de tener `pyarrow` o `fastparquet` instalados (`pip install pyarrow`).")
+
+    st.markdown("""
+    **Justificación de la Migración:** La migración de datos limpios a un Data Warehouse (DW) típicamente implica:
+    * **Extract (Extraer):** Obtener datos de las fuentes.
+    * **Transform (Transformar):** Los datos son limpiados, estandarizados, validados y preparados para ajustarse al esquema del DW. Esta es la fase que hemos detallado en esta aplicación.
+    * **Load (Cargar):** Los datos transformados se cargan en las tablas dimensionales y de hechos del DW. Los formatos como CSV son universales, pero Parquet es preferido en entornos de Big Data y DW por su eficiencia. La simulación de descarga CSV/Parquet representa la salida de este proceso de transformación, lista para ser cargada en un sistema optimizado para consultas analíticas.
+    """)
+
+    st.subheader("3.4. Generar Informe Completo")
+    st.write("Descarga un informe HTML con un resumen de los indicadores de calidad, EDA y resultados del clustering.")
+    
+    if st.button("Generar y Descargar Informe HTML"):
+        # Asegurarse de que todos los datos necesarios para el informe están disponibles
+        if st.session_state['df_nulos_comp'].empty:
+            st.error("Por favor, ejecuta la sección '2. Limpieza y Validación de Datos' para generar los indicadores de calidad antes de generar el informe.")
+        elif not st.session_state['kpis'] or not st.session_state['eda_plots_data']:
+            st.error("Por favor, ejecuta la sección '4. EDA Avanzado & Dashboards' para generar los KPIs y gráficos de EDA antes de generar el informe.")
+        elif st.session_state['cluster_results_data'].get('n_clusters', 0) == 0:
+            st.warning("El modelo de Clustering no se ha ejecutado o no ha encontrado clusters. El informe incluirá una nota al respecto en esa sección.")
+            # Continuar de todos modos, pero advertir.
+            
             html_report_data = generate_html_report(
-                df_cleaned=df_cleaned,
+                df_cleaned=st.session_state['df_cleaned'],
+                df_original=st.session_state['df_original'],
+                df_nulos_comp=st.session_state['df_nulos_comp'],
                 indicators_original=st.session_state['indicators_original'],
                 indicators_cleaned=st.session_state['indicators_cleaned'],
                 kpis=st.session_state['kpis'],
                 eda_plots=st.session_state['eda_plots_data'],
                 cluster_results=st.session_state['cluster_results_data']
             )
-
             st.download_button(
-                label="Descargar Informe Completo (HTML)",
-                data=html_report_data.encode("utf-8"),
-                file_name="informe_analisis_calidad_pacientes.html",
+                label="Descargar Informe HTML",
+                data=html_report_data,
+                file_name="informe_calidad_datos_pacientes.html",
                 mime="text/html",
-                key="download_html_report"
+                help="Genera y descarga un informe HTML completo."
             )
-
-
-# --- Nueva Sección 4: EDA Avanzado y Dashboards ---
-elif selected_section == "4. EDA Avanzado & Dashboards":
-    st.header("4. 📊 EDA Avanzado y Dashboards Interactivos")
-    st.markdown("Exploración profunda de los datos limpios y creación de visualizaciones interactivas.")
-
-    if 'df_cleaned' not in st.session_state or st.session_state['df_cleaned'].empty:
-        st.warning("Por favor, navega primero a la sección 'Limpieza y Validación' para cargar los datos limpios.")
-        st.stop()
-    else:
-        df_display = st.session_state['df_cleaned'].copy()
-
-        st.subheader("Filtros del Dashboard")
-        col1, col2, col3 = st.columns(3)
-
-        # Filtro por ciudad
-        all_cities = ['Todas'] + sorted(df_display['ciudad'].dropna().unique().tolist())
-        selected_city_filter = col1.selectbox("Filtrar por Ciudad:", all_cities, key="city_filter")
-        if selected_city_filter != 'Todas':
-            df_display = df_display[df_display['ciudad'] == selected_city_filter]
-
-        # Filtro por sexo
-        unique_sexes = df_display['sexo'].dropna().unique().tolist()
-        if df_display['sexo'].isnull().any():
-            unique_sexes.append('No especificado') # Añadir una opción para nulos
-        all_sex = ['Todos'] + sorted(unique_sexes)
-        selected_sex_filter = col2.selectbox("Filtrar por Sexo:", all_sex, key="sex_filter")
-        if selected_sex_filter == 'No especificado':
-            df_display = df_display[df_display['sexo'].isnull()]
-        elif selected_sex_filter != 'Todos':
-            df_display = df_display[df_display['sexo'] == selected_sex_filter]
-
-        # Filtro por rango de edad
-        if not df_display['edad'].dropna().empty:
-            min_age_data = int(df_display['edad'].min())
-            max_age_data = int(df_display['edad'].max())
-            age_range = col3.slider("Rango de Edad:", min_value=min_age_data, max_value=max_age_data, value=(min_age_data, max_age_data), key="age_range_filter")
-            df_display = df_display[(df_display['edad'] >= age_range[0]) & (df_display['edad'] <= age_range[1])]
+            st.success("Informe HTML generado y listo para descargar.")
         else:
-            col3.info("No hay edades disponibles para filtrar.")
-
-
-        st.subheader("Métricas Clave (KPIs)")
-        num_patients = len(df_display)
-        avg_age = df_display['edad'].mean()
-        most_common_city = df_display['ciudad'].mode()[0] if not df_display['ciudad'].empty else "N/A"
-
-        kpi1, kpi2, kpi3 = st.columns(3)
-        with kpi1:
-            st.metric("Total de Pacientes (Filtrados)", num_patients)
-        with kpi2:
-            st.metric("Edad Promedio (Filtrada)", f"{avg_age:.1f}" if not pd.isna(avg_age) else "N/A")
-        with kpi3:
-            st.metric("Ciudad Más Común", most_common_city)
-
-        st.session_state['kpis'] = { # Guardar KPIs para el informe
-            'num_patients': num_patients,
-            'avg_age': avg_age,
-            'most_common_city': most_common_city
-        }
-
-        st.subheader("Visualizaciones Detalladas")
-
-        # Limpiar lista de plots para el informe en cada ejecución de EDA
-        st.session_state['eda_plots_data'] = []
-
-        if not df_display.empty:
-            # --- NUEVA FUNCIONALIDAD: Personalización de Gráficos de Edad ---
-            st.markdown("#### Distribución de Edad")
-            age_plot_type = st.selectbox(
-                "Selecciona el tipo de gráfico para la Distribución de Edad:",
-                ("Histograma", "Diagrama de Caja", "Diagrama de Violín", "Densidad (KDE)"),
-                key="age_plot_selector"
+            html_report_data = generate_html_report(
+                df_cleaned=st.session_state['df_cleaned'],
+                df_original=st.session_state['df_original'],
+                df_nulos_comp=st.session_state['df_nulos_comp'],
+                indicators_original=st.session_state['indicators_original'],
+                indicators_cleaned=st.session_state['indicators_cleaned'],
+                kpis=st.session_state['kpis'],
+                eda_plots=st.session_state['eda_plots_data'],
+                cluster_results=st.session_state['cluster_results_data']
             )
+            st.download_button(
+                label="Descargar Informe HTML",
+                data=html_report_data,
+                file_name="informe_calidad_datos_pacientes.html",
+                mime="text/html",
+                help="Genera y descarga un informe HTML completo."
+            )
+            st.success("Informe HTML generado y listo para descargar.")
 
-            fig_age, ax_age = plt.subplots(figsize=(10, 6))
-            if age_plot_type == "Histograma":
-                sns.histplot(df_display['edad'].dropna(), kde=True, ax=ax_age, color="skyblue")
-                ax_age.set_title('Histograma de Edad con Estimación de Densidad')
-            elif age_plot_type == "Diagrama de Caja":
-                sns.boxplot(y=df_display['edad'].dropna(), ax=ax_age, color="lightgreen")
-                ax_age.set_title('Diagrama de Caja de Edad')
-            elif age_plot_type == "Diagrama de Violín":
-                sns.violinplot(y=df_display['edad'].dropna(), ax=ax_age, color="salmon")
-                ax_age.set_title('Diagrama de Violín de Edad')
-            elif age_plot_type == "Densidad (KDE)":
-                sns.kdeplot(df_display['edad'].dropna(), fill=True, ax=ax_age, color="purple")
-                ax_age.set_title('Estimación de Densidad de Kernel (KDE) de Edad')
 
-            ax_age.set_ylabel('Frecuencia' if age_plot_type == "Histograma" else 'Edad')
-            ax_age.set_xlabel('Edad' if age_plot_type == "Histograma" else '')
-            st.pyplot(fig_age)
-            st.markdown(f"Este gráfico de **{age_plot_type}** visualiza la distribución de la edad.")
-            # Guardar la imagen para el informe HTML
-            buf = io.BytesIO()
-            fig_age.savefig(buf, format="png", bbox_inches="tight")
-            st.session_state['eda_plots_data'].append((f"Distribución de Edad ({age_plot_type})", base64.b64encode(buf.getvalue()).decode()))
-            plt.close(fig_age) # Es importante cerrar las figuras de matplotlib
+# --- Sección 4: EDA Avanzado & Dashboards ---
+elif section == "4. EDA Avanzado & Dashboards":
+    st.header("4. Análisis Exploratorio de Datos (EDA) Avanzado & Dashboards")
+    st.write("Explora patrones y tendencias en los datos limpios a través de visualizaciones.")
 
-            # Distribución de Género por Ciudad
-            st.markdown("#### Distribución de Pacientes por Género y Ciudad")
-            # Asegurarse de que haya datos para agrupar
-            if not df_display[['ciudad', 'sexo']].dropna().empty:
-                sex_city_counts = df_display.groupby(['ciudad', 'sexo']).size().unstack(fill_value=0)
-                fig_sex_city, ax_sex_city = plt.subplots(figsize=(12, 7))
-                sex_city_counts.plot(kind='bar', stacked=True, ax=ax_sex_city, cmap='Pastel1')
-                ax_sex_city.set_title('Número de Pacientes por Ciudad y Género')
-                ax_sex_city.set_xlabel('Ciudad')
-                ax_sex_city.set_ylabel('Número de Pacientes')
-                plt.xticks(rotation=45, ha='right')
-                st.pyplot(fig_sex_city)
-                st.dataframe(sex_city_counts)
-                st.markdown("Este gráfico de barras apiladas muestra la composición por género dentro de cada ciudad.")
-                # Guardar la imagen para el informe HTML
-                buf = io.BytesIO()
-                fig_sex_city.savefig(buf, format="png", bbox_inches="tight")
-                st.session_state['eda_plots_data'].append(("Distribución de Género por Ciudad", base64.b64encode(buf.getvalue()).decode()))
-                plt.close(fig_sex_city)
-            else:
-                st.info("No hay datos suficientes para generar el gráfico de Género por Ciudad con los filtros actuales.")
+    df_cleaned_eda = st.session_state['df_cleaned'].copy()
 
-            # Edad Promedio por Ciudad y Género
-            st.markdown("#### Edad Promedio por Ciudad y Género")
-            if not df_display[['ciudad', 'sexo', 'edad']].dropna().empty:
-                avg_age_city_sex = df_display.groupby(['ciudad', 'sexo'])['edad'].mean().unstack()
+    # Calcular KPIs
+    kpis = get_kpis(df_cleaned_eda)
+    st.session_state['kpis'] = kpis # Guardar KPIs en session state
 
-                # Ensure numerical type and replace any non-numeric with NaN
-                avg_age_city_sex = avg_age_city_sex.astype(float).fillna(np.nan)
+    st.subheader("Key Performance Indicators (KPIs)")
+    kpi_cols = st.columns(4)
+    kpi_cols[0].metric("Total Pacientes", kpis['total_pacientes'])
+    kpi_cols[1].metric("Edad Promedio", f"{kpis['edad_promedio']:.2f}")
+    kpi_cols[2].metric("Pacientes con Email", kpis['pacientes_con_email'])
+    kpi_cols[3].metric("Pacientes con Teléfono", kpis['pacientes_con_telefono'])
 
-                fig_avg_age, ax_avg_age = plt.subplots(figsize=(12, 7))
-                sns.heatmap(avg_age_city_sex, annot=True, fmt=".1f", cmap="YlGnBu", linewidths=.5, ax=ax_avg_age)
-                ax_avg_age.set_title('Edad Promedio por Ciudad y Género')
-                st.pyplot(fig_avg_age)
-                st.dataframe(avg_age_city_sex)
-                st.markdown("Un mapa de calor para visualizar rápidamente la edad promedio en diferentes combinaciones de ciudad y género.")
-                # Guardar la imagen para el informe HTML
-                buf = io.BytesIO()
-                fig_avg_age.savefig(buf, format="png", bbox_inches="tight")
-                st.session_state['eda_plots_data'].append(("Edad Promedio por Ciudad y Género (Mapa de Calor)", base64.b64encode(buf.getvalue()).decode()))
-                plt.close(fig_avg_age)
-            else:
-                st.info("No hay datos suficientes para generar el mapa de calor de Edad Promedio por Ciudad y Género con los filtros actuales.")
+    kpi_cols2 = st.columns(4)
+    kpi_cols2[0].metric("Hombres (%)", f"{kpis['porcentaje_hombres']:.2f}%")
+    kpi_cols2[1].metric("Mujeres (%)", f"{kpis['porcentaje_mujeres']:.2f}%")
+    kpi_cols2[2].metric("Ciudades Únicas", kpis['ciudades_unicas'])
+    kpi_cols2[3].metric("Emails Inválidos", kpis['emails_invalidos_conteo'])
 
-            # --- NUEVA FUNCIONALIDAD: Análisis de Correlación ---
-            st.markdown("#### Matriz de Correlación entre Características Numéricas")
-            numeric_cols = df_display.select_dtypes(include=np.number).columns.tolist()
+    st.subheader("Visualizaciones Interactivas")
 
-            if len(numeric_cols) > 1: # Necesitas al menos dos columnas numéricas
-                corr_matrix = df_display[numeric_cols].corr()
-                fig_corr, ax_corr = plt.subplots(figsize=(10, 8))
-                sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f", linewidths=.5, ax=ax_corr)
-                ax_corr.set_title('Matriz de Correlación de Características Numéricas')
-                st.pyplot(fig_corr)
-                st.markdown("Un mapa de calor que muestra la correlación entre las características numéricas del dataset. Valores cercanos a 1 o -1 indican una fuerte correlación positiva o negativa, respectivamente.")
-                # Guardar para el informe HTML
-                buf = io.BytesIO()
-                fig_corr.savefig(buf, format="png", bbox_inches="tight")
-                st.session_state['eda_plots_data'].append(("Matriz de Correlación", base64.b64encode(buf.getvalue()).decode()))
-                plt.close(fig_corr)
-            else:
-                st.info("No hay suficientes columnas numéricas para generar una matriz de correlación.")
+    # Generar y mostrar gráficos EDA
+    eda_plots = generate_eda_plots(df_cleaned_eda)
+    st.session_state['eda_plots_data'] = eda_plots # Guardar plots en session state
 
-            # --- NUEVA FUNCIONALIDAD: Gráficos Interactivos (Plotly Express) ---
-            st.markdown("---")
-            st.markdown("#### Distribución de Edad (Interactiva - Plotly)")
-            if not df_display['edad'].dropna().empty:
-                fig_age_interactive = px.histogram(
-                    df_display.dropna(subset=['edad']), # Dropna si el gráfico de Plotly no maneja NaNs directamente
-                    x='edad',
-                    nbins=20,
-                    title='Distribución Interactiva de Edad',
-                    labels={'edad': 'Edad del Paciente'},
-                    template='plotly_white'
-                )
-                fig_age_interactive.update_layout(bargap=0.1)
-                st.plotly_chart(fig_age_interactive, use_container_width=True)
-                st.markdown("Un histograma interactivo de la distribución de edad, permitiendo zoom y hover para detalles.")
-                # Plotly charts no se guardan directamente como PNG en base64 para el informe HTML de la misma manera que Matplotlib.
-                # Para un informe HTML completo con Plotly, necesitarías exportar la figura como HTML/JSON o una imagen estática.
-                # Para este ejemplo, lo dejaremos como una visualización interactiva en la app y no en el informe por simplicidad.
-            else:
-                st.info("No hay datos de edad para mostrar en el gráfico interactivo.")
+    for title, fig in eda_plots:
+        st.plotly_chart(fig, use_container_width=True)
 
-            # --- NUEVA FUNCIONALIDAD: Distribución de Datos Categóricos ---
-            st.markdown("---")
-            st.markdown("#### Distribución de Otras Variables Categóricas")
-            # Simular más columnas categóricas si no existen en tu dataset original
-            if 'tipo_sangre' not in df_display.columns:
-                blood_types = ['O+', 'A+', 'B+', 'AB+', 'O-', 'A-', 'B-', 'AB-']
-                df_display['tipo_sangre'] = np.random.choice(blood_types, size=len(df_display))
-
-            # Filtra columnas categóricas, excluyendo 'ciudad' y 'sexo' que ya se grafican, y las de identificadores
-            other_categorical_cols = [
-                col for col in df_display.select_dtypes(include='object').columns
-                if col not in ['ciudad', 'sexo', 'nombre', 'email', 'telefono']
-            ]
-
-            if other_categorical_cols:
-                selected_cat_col = st.selectbox(
-                    "Selecciona otra columna categórica para visualizar su distribución:",
-                    ['Ninguna'] + other_categorical_cols,
-                    key="other_cat_select"
-                )
-                if selected_cat_col != 'Ninguna':
-                    fig_cat, ax_cat = plt.subplots(figsize=(10, 6))
-                    sns.countplot(y=df_display[selected_cat_col].dropna(), order=df_display[selected_cat_col].value_counts().index, ax=ax_cat, palette='viridis')
-                    ax_cat.set_title(f'Distribución de {selected_cat_col}')
-                    ax_cat.set_xlabel('Conteo')
-                    ax_cat.set_ylabel(selected_cat_col)
-                    st.pyplot(fig_cat)
-                    st.markdown(f"Este gráfico de barras muestra la frecuencia de cada categoría en la columna **'{selected_cat_col}'**.")
-
-                    # Guardar para el informe HTML
-                    buf = io.BytesIO()
-                    fig_cat.savefig(buf, format="png", bbox_inches="tight")
-                    st.session_state['eda_plots_data'].append((f"Distribución de {selected_cat_col}", base64.b64encode(buf.getvalue()).decode()))
-                    plt.close(fig_cat)
-            else:
-                st.info("No hay otras columnas categóricas disponibles para visualizar su distribución.")
-
-            # --- NUEVA FUNCIONALIDAD: Tendencias Temporales ---
-            st.markdown("---")
-            st.markdown("#### Tendencias Temporales (Ej. Conteo de Pacientes por Mes)")
-            # Asumiendo que tienes una columna 'fecha_registro' en formato datetime
-            # Para demostración, si no la tienes, puedes simular una
-            if 'fecha_registro' not in df_display.columns:
-                df_display['fecha_registro'] = pd.to_datetime(pd.to_datetime('2023-01-01') + pd.to_timedelta(np.random.randint(0, 365, len(df_display)), unit='D'))
-
-            if 'fecha_registro' in df_display.columns and pd.api.types.is_datetime64_any_dtype(df_display['fecha_registro']):
-                df_display['mes_registro'] = df_display['fecha_registro'].dt.to_period('M').astype(str)
-                patients_by_month = df_display['mes_registro'].value_counts().sort_index()
-
-                if not patients_by_month.empty:
-                    fig_time, ax_time = plt.subplots(figsize=(12, 6))
-                    patients_by_month.plot(kind='line', marker='o', ax=ax_time, color='teal')
-                    ax_time.set_title('Conteo de Pacientes Registrados por Mes')
-                    ax_time.set_xlabel('Mes de Registro')
-                    ax_time.set_ylabel('Número de Pacientes')
-                    plt.xticks(rotation=45)
-                    st.pyplot(fig_time)
-                    st.markdown("Muestra cómo el número de pacientes registrados varía a lo largo del tiempo.")
-
-                    # Guardar para el informe HTML
-                    buf = io.BytesIO()
-                    fig_time.savefig(buf, format="png", bbox_inches="tight")
-                    st.session_state['eda_plots_data'].append(("Tendencia de Pacientes por Mes", base64.b64encode(buf.getvalue()).decode()))
-                    plt.close(fig_time)
-                else:
-                    st.info("No hay datos de fecha de registro para analizar tendencias temporales.")
-            else:
-                st.info("La columna 'fecha_registro' no está disponible o no tiene el formato de fecha adecuado para analizar tendencias.")
-
-        else:
-            st.info("No hay datos para mostrar con los filtros seleccionados.")
-
-# --- Nueva Sección 5: Modelado de Machine Learning (Agrupación) ---
-elif selected_section == "5. Modelado de Machine Learning":
-    st.header("5. 🧠 Modelado de Machine Learning: Agrupación de Pacientes (Clustering)")
-    st.markdown("Identificación de segmentos de pacientes con características similares utilizando K-Means.")
-
-    if 'df_cleaned' not in st.session_state or st.session_state['df_cleaned'].empty:
-        st.warning("Por favor, navega primero a la sección 'Limpieza y Validación' para cargar los datos limpios.")
-        st.stop()
+    st.subheader("Análisis de Correlación (para variables numéricas)")
+    numeric_df = df_cleaned_eda.select_dtypes(include=np.number)
+    if not numeric_df.empty:
+        corr_matrix = numeric_df.corr()
+        fig_corr = px.imshow(corr_matrix, text_auto=True, aspect="auto",
+                            title="Matriz de Correlación de Variables Numéricas")
+        st.plotly_chart(fig_corr, use_container_width=True)
     else:
-        df_ml = st.session_state['df_cleaned'].copy()
+        st.info("No hay suficientes variables numéricas para mostrar una matriz de correlación.")
 
-        st.subheader("Preparación de Datos para ML y Selección de Características")
 
-        # --- Simular más características si no existen (asegurando que existan para el selectbox) ---
-        if 'tipo_sangre' not in df_ml.columns:
-            blood_types = ['O+', 'A+', 'B+', 'AB+', 'O-', 'A-', 'B-', 'AB-']
-            df_ml['tipo_sangre'] = np.random.choice(blood_types, size=len(df_ml))
-        if 'presion_arterial_sistolica' not in df_ml.columns:
-            df_ml['presion_arterial_sistolica'] = np.random.randint(90, 180, size=len(df_ml))
-        if 'presion_arterial_diastolica' not in df_ml.columns:
-            df_ml['presion_arterial_diastolica'] = np.random.randint(60, 120, size=len(df_ml))
-        # También asegúrate de que 'edad' es numérica para el ML
-        df_ml['edad'] = pd.to_numeric(df_ml['edad'], errors='coerce')
-        # --- Fin de simulación ---
+# --- Sección 5: Modelado de Machine Learning (Clustering) ---
+elif section == "5. Modelado de Machine Learning (Clustering)":
+    st.header("5. Modelado de Machine Learning (Clustering)")
+    st.write("Identifica segmentos de pacientes utilizando algoritmos de clustering (K-Means).")
 
-        # Filtrar columnas disponibles para ML (excluyendo identificadores y columnas que ya no usaremos para ML)
-        available_features = [col for col in df_ml.columns if col not in ['id_paciente', 'nombre', 'email', 'telefono', 'fecha_nacimiento', 'mes_registro']]
+    df_model = st.session_state['df_cleaned'].copy()
 
-        # Permitir al usuario seleccionar las características
-        selected_features = st.multiselect(
-            "Selecciona las características para el clustering:",
-            available_features,
-            default=[f for f in ['edad', 'sexo', 'ciudad', 'tipo_sangre', 'presion_arterial_sistolica', 'presion_arterial_diastolica'] if f in available_features], # Valores por defecto, verificando existencia
-            key="ml_features_select"
-        )
+    # Preprocesamiento para Clustering
+    # Seleccionar características relevantes (edad, y variables dummy para sexo, ciudad)
+    features_df = df_model[['edad', 'sexo', 'ciudad']].copy()
 
-        if not selected_features:
-            st.warning("Por favor, selecciona al menos una característica para el clustering.")
-            st.stop()
+    # Eliminar filas con nulos en estas características para el clustering
+    features_df.dropna(subset=['edad', 'sexo', 'ciudad'], inplace=True)
+    
+    if features_df.empty:
+        st.error("No hay datos suficientes después de limpiar nulos en edad, sexo y ciudad para realizar clustering.")
+    else:
+        st.info(f"Se utilizarán {len(features_df)} de {len(df_model)} registros para el clustering después de eliminar nulos.")
 
-        # Manejo de nulos en las características seleccionadas: dropear filas con nulos
-        df_ml_filtered = df_ml[selected_features].dropna()
+        # Codificación One-Hot para variables categóricas
+        features_df = pd.get_dummies(features_df, columns=['sexo', 'ciudad'], drop_first=True)
 
-        if df_ml_filtered.empty:
-            st.warning("No hay suficientes datos limpios y completos con las características seleccionadas para realizar el clustering.")
-            st.stop()
+        # Escalar las características numéricas
+        scaler = StandardScaler()
+        scaled_features = scaler.fit_transform(features_df)
+        scaled_features_df = pd.DataFrame(scaled_features, columns=features_df.columns, index=features_df.index)
 
-        # Identificar características numéricas y categóricas dentro de las seleccionadas y filtradas
-        numeric_features = [f for f in selected_features if pd.api.types.is_numeric_dtype(df_ml_filtered[f])]
-        categorical_features = [f for f in selected_features if pd.api.types.is_object_dtype(df_ml_filtered[f]) or pd.api.types.is_string_dtype(df_ml_filtered[f])]
-
-        if not numeric_features and not categorical_features:
-            st.warning("Las características seleccionadas no son ni numéricas ni categóricas válidas para el preprocesamiento. Por favor, revisa tu selección.")
-            st.stop()
-
-        # Crear un preprocesador usando ColumnTransformer
-        transformers = []
-        if numeric_features:
-            transformers.append(('num', StandardScaler(), numeric_features))
-        if categorical_features:
-            transformers.append(('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features))
-
-        preprocessor = ColumnTransformer(transformers, remainder='passthrough')
-
-        # Ajustar y transformar los datos
-        X_scaled_all = preprocessor.fit_transform(df_ml_filtered)
-
-        st.write("Datos preprocesados y escalados para el modelo de clustering (dimensiones):", X_scaled_all.shape)
-        st.markdown("**Justificación:** Las características numéricas se escalan para igualar su contribución. Las categóricas se convierten a formato numérico (One-Hot Encoding) para que el algoritmo K-Means pueda procesarlas.")
-
-        st.subheader("Determinación del Número Óptimo de Clusters (Método del Codo)")
-
-        # --- Implementación Manual del Método del Codo ---
-        sse = [] # Suma de Errores Cuadrados (o Inercia)
-        # Prueba un rango de K de 1 a 10 (o ajusta según sea necesario)
-        # Asegurarse de que k_range no exceda el número de muestras o 10
-        k_range_limit = min(11, X_scaled_all.shape[0])
-        k_range = range(1, k_range_limit)
-
-        if k_range_limit <= 1:
-            st.info("Se necesitan al menos 2 puntos para realizar el método del codo.")
+        st.subheader("Selección del Número de Clusters (K)")
+        max_clusters = min(10, len(scaled_features_df) - 1) # Asegura que no haya más clusters que datos-1
+        if max_clusters < 2:
+            st.warning("No hay suficientes datos para realizar clustering con K > 1. Necesitas al menos 2 puntos de datos.")
         else:
-            with st.spinner("Calculando el Método del Codo..."):
-                for k in k_range:
-                    try:
-                        kmeans_model = KMeans(n_clusters=k, random_state=42, n_init='auto')
-                        kmeans_model.fit(X_scaled_all)
-                        sse.append(kmeans_model.inertia_)
-                    except ValueError as e:
-                        st.error(f"Error al calcular la inercia para k={k}: {e}")
-                        sse.append(np.nan) # Añadir nan si ocurre un error
+            n_clusters_option = st.slider("Selecciona el número de clusters (K):", min_value=2, max_value=max_clusters, value=min(3, max_clusters))
 
-            if any(pd.notna(s) for s in sse): # Solo graficar si hay valores válidos
-                fig_elbow, ax_elbow = plt.subplots(figsize=(10, 6))
-                ax_elbow.plot(k_range, sse, marker='o', linestyle='--')
-                ax_elbow.set_title('Método del Codo para K-Means')
-                ax_elbow.set_xlabel('Número de Clusters (k)')
-                ax_elbow.set_ylabel('Inercia (SSE)')
-                ax_elbow.grid(True)
-                st.pyplot(fig_elbow)
-                plt.close(fig_elbow) # Cerrar figura para liberar memoria
-                st.markdown("""
-                El **Método del Codo** ayuda a determinar el número óptimo de clusters (`k`). Se busca el punto en el gráfico donde la inercia (suma de cuadrados dentro del cluster) disminuye significativamente, formando una "rodilla" o "codo".
-                """)
-            else:
-                st.info("No se pudo generar el gráfico del Método del Codo debido a datos insuficientes o errores en el cálculo.")
-        # --- Fin de la Implementación Manual del Método del Codo ---
+            if st.button("Ejecutar Clustering K-Means"):
+                with st.spinner(f"Ejecutando K-Means con {n_clusters_option} clusters..."):
+                    kmeans = KMeans(n_clusters=n_clusters_option, random_state=42, n_init=10) # n_init por deprecation warning
+                    features_df['cluster'] = kmeans.fit_predict(scaled_features)
 
+                    # Calcular métricas de evaluación
+                    if len(features_df) >= n_clusters_option: # Métrica de Silueta requiere al menos n_clusters puntos
+                        silhouette_avg = silhouette_score(scaled_features, features_df['cluster'])
+                        davies_bouldin_idx = davies_bouldin_index(scaled_features, features_df['cluster'])
+                        calinski_harabasz_idx = calinski_harabasz_index(scaled_features, features_df['cluster'])
+                    else:
+                        silhouette_avg = np.nan
+                        davies_bouldin_idx = np.nan
+                        calinski_harabasz_idx = np.nan
 
-        # Slider para que el usuario elija el número de clusters
-        st.subheader("Configuración del Modelo K-Means")
-        # Asegurarse de que el número máximo de clusters sea válido
-        n_clusters_max_slider = min(8, X_scaled_all.shape[0] - 1 if X_scaled_all.shape[0] > 1 else 1)
-        if n_clusters_max_slider < 2:
-            st.warning("No hay suficientes datos para formar al menos 2 clusters. Asegúrate de tener suficientes registros después del filtrado.")
-            st.stop()
-        n_clusters = st.slider("Selecciona el número de clusters (k):", min_value=2, max_value=n_clusters_max_slider, value=min(3, n_clusters_max_slider), key="n_clusters_slider")
+                    inertia = kmeans.inertia_
 
-        # Entrenamiento del modelo
-        with st.spinner(f"Entrenando modelo K-Means con {n_clusters} clusters..."):
-            try:
-                kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
-                df_ml_filtered['cluster'] = kmeans.fit_predict(X_scaled_all)
-                st.success(f"Modelo K-Means entrenado con **{n_clusters}** clusters.")
+                    st.session_state['cluster_results_data'] = {
+                        'n_clusters': n_clusters_option,
+                        'silhouette_score': silhouette_avg,
+                        'davies_bouldin_index': davies_bouldin_idx,
+                        'calinski_harabasz_index': calinski_harabasz_idx,
+                        'inertia': inertia
+                    }
 
-                # Calcular métricas de evaluación
-                sil_score = silhouette_score(X_scaled_all, df_ml_filtered['cluster'])
-                db_score = davies_bouldin_score(X_scaled_all, df_ml_filtered['cluster'])
-                ch_score = calinski_harabasz_score(X_scaled_all, df_ml_filtered['cluster'])
-                inertia_val = kmeans.inertia_
+                    st.subheader("Resultados del Clustering")
+                    st.write(f"**Número de Clusters:** {n_clusters_option}")
+                    st.write(f"**Puntuación de Silueta:** {silhouette_avg:.2f}")
+                    st.write(f"**Índice Davies-Bouldin:** {davies_bouldin_idx:.2f}")
+                    st.write(f"**Índice Calinski-Harabasz:** {calinski_harabasz_idx:.2f}")
+                    st.write(f"**Inercia (Sum of Squared Distances):** {inertia:.2f}")
 
-                # Guardar métricas en session_state para el informe
-                st.session_state['cluster_results_data']['n_clusters'] = n_clusters
-                st.session_state['cluster_results_data']['silhouette_score'] = sil_score
-                st.session_state['cluster_results_data']['davies_bouldin_index'] = db_score
-                st.session_state['cluster_results_data']['calinski_harabasz_index'] = ch_score
-                st.session_state['cluster_results_data']['inertia'] = inertia_val
+                    # Añadir las asignaciones de cluster al DataFrame limpio original
+                    st.session_state['df_cleaned'] = st.session_state['df_cleaned'].merge(
+                        features_df[['cluster']],
+                        left_index=True,
+                        right_index=True,
+                        how='left'
+                    )
+                    st.session_state['df_cleaned']['cluster'] = st.session_state['df_cleaned']['cluster'].astype('Int64') # Para soportar nulos
 
-            except Exception as e:
-                st.error(f"Error al entrenar el modelo K-Means: {e}")
-                st.stop() # Detener la ejecución si el entrenamiento falla
+                    st.write("### Características de los Clusters (Centros de Cluster)")
+                    cluster_centers_df = pd.DataFrame(scaler.inverse_transform(kmeans.cluster_centers_), columns=features_df.columns)
+                    cluster_centers_df['cluster'] = range(n_clusters_option)
+                    cluster_centers_df.set_index('cluster', inplace=True)
+                    st.dataframe(cluster_centers_df)
+                    st.session_state['cluster_results_data']['cluster_centers_df'] = cluster_centers_df
 
-        st.subheader("Resultados del Agrupamiento")
+                    st.write("### Conteo de Pacientes por Cluster")
+                    cluster_counts = features_df['cluster'].value_counts().sort_index().reset_index()
+                    cluster_counts.columns = ['Cluster', 'Conteo de Pacientes']
+                    st.dataframe(cluster_counts)
+                    st.session_state['cluster_results_data']['cluster_counts_df'] = cluster_counts
 
-        # Limpiar resultados de cluster para el informe en cada ejecución
-        st.session_state['cluster_results_data']['cluster_plots_data'] = []
+                    st.write("### Visualización de Clusters")
+                    cluster_plots = []
 
-        # Características promedio por cluster (en escala original para numéricas, y distribuciones para categóricas)
-        st.markdown("#### Características Promedio por Cluster (en escala original para numéricas)")
+                    # Gráfico de dispersión de Edad vs. Sexo (si es posible, para una mejor visualización)
+                    # Necesitamos df_cleaned con la columna de cluster
+                    df_plot_clusters = st.session_state['df_cleaned'].dropna(subset=['edad', 'sexo', 'cluster'])
+                    if not df_plot_clusters.empty:
+                        fig_cluster_age_sex = px.scatter(
+                            df_plot_clusters,
+                            x='edad',
+                            y='sexo',
+                            color='cluster',
+                            title='Clusters por Edad y Sexo',
+                            hover_data=['nombre', 'ciudad']
+                        )
+                        cluster_plots.append(("Clusters por Edad y Sexo", fig_cluster_age_sex))
+                        st.plotly_chart(fig_cluster_age_sex, use_container_width=True)
 
-        # Invertir la transformación solo para las características numéricas originales
-        # Necesitamos el OneHotEncoder para saber los nombres de las columnas categóricas después de la transformación
-        # para que StandardScaler.inverse_transform trabaje correctamente en el subconjunto numérico.
-        # Una forma más robusta es obtener los nombres de las columnas transformadas:
-        ohe_feature_names = preprocessor.named_transformers_['cat'].get_feature_names_out(categorical_features).tolist() if 'cat' in preprocessor.named_transformers_ else []
-        all_transformed_features = numeric_features + ohe_feature_names
-
-        # Reconstruir un DataFrame para facilitar la interpretación de los centros de cluster
-        # Esto es un poco más complejo porque KMeans.cluster_centers_ está en el espacio transformado.
-        # Para interpretar los centros en la escala original, necesitamos aplicar la inversa de StandardScaler.
-        # Para categóricas, no hay una 'inversa' directa, se interpreta por la proporción de 1s.
-
-        cluster_df_num = pd.DataFrame() # Initialize empty DataFrame
-        if numeric_features:
-            scaler = preprocessor.named_transformers_['num']
-            # Obtener solo las columnas numéricas de los centros
-            # Esto asumes que las columnas numéricas están al principio de X_scaled_all
-            cluster_centers_scaled_num = kmeans.cluster_centers_[:, :len(numeric_features)]
-            cluster_centers_original_num = scaler.inverse_transform(cluster_centers_scaled_num)
-            cluster_df_num = pd.DataFrame(cluster_centers_original_num, columns=numeric_features)
-            cluster_df_num['Cluster'] = range(n_clusters)
-            st.dataframe(cluster_df_num.set_index('Cluster'))
-        else:
-            st.info("No hay características numéricas seleccionadas para mostrar promedios por cluster.")
-
-        # Guardar para el informe HTML
-        st.session_state['cluster_results_data']['cluster_centers_df'] = cluster_df_num
-
-
-        # Para características categóricas
-        if categorical_features:
-            st.markdown("#### Distribución de Características Categóricas por Cluster")
-            for cat_feat in categorical_features:
-                st.write(f"**Distribución de '{cat_feat}' por Cluster:**")
-                cat_dist = df_ml_filtered.groupby('cluster')[cat_feat].value_counts(normalize=True).unstack(fill_value=0)
-                st.dataframe(cat_dist.style.format("{:.2%}")) # Formato porcentaje
-
-        st.markdown("Estos valores representan el centro de cada cluster para características numéricas y la distribución de categorías para las categóricas, ayudando a interpretar lo que define a cada grupo de pacientes.")
-
-
-        # Conteo de pacientes por cluster
-        st.markdown("#### Conteo de Pacientes por Cluster")
-        cluster_counts = df_ml_filtered['cluster'].value_counts().sort_index()
-        fig_cluster_counts, ax_cluster_counts = plt.subplots(figsize=(8, 5))
-        sns.barplot(x=cluster_counts.index, y=cluster_counts.values, ax=ax_cluster_counts, palette="viridis")
-        ax_cluster_counts.set_title('Número de Pacientes por Cluster')
-        ax_cluster_counts.set_xlabel('Cluster')
-        ax_cluster_counts.set_ylabel('Conteo de Pacientes')
-        st.pyplot(fig_cluster_counts)
-        st.dataframe(cluster_counts.to_frame(name='Conteo'))
-        st.markdown("Este gráfico de barras apiladas muestra cuántos pacientes fueron asignados a cada cluster.")
-        # Guardar para el informe HTML
-        buf = io.BytesIO()
-        fig_cluster_counts.savefig(buf, format="png", bbox_inches="tight")
-        st.session_state['cluster_results_data']['cluster_plots_data'].append(("Conteo de Pacientes por Cluster", base64.b64encode(buf.getvalue()).decode()))
-        plt.close(fig_cluster_counts)
-        st.session_state['cluster_results_data']['cluster_counts_df'] = cluster_counts.to_frame(name='Conteo')
-
-
-        # Visualización de los clusters (Distribución de Edad por Cluster)
-        # Asegurarse de que 'edad' esté en el df_ml_filtered y sea numérica
-        if 'edad' in df_ml_filtered.columns and pd.api.types.is_numeric_dtype(df_ml_filtered['edad']):
-            st.markdown("#### Visualización de Clusters (Distribución de Edad por Cluster)")
-            fig_cluster_dist, ax_cluster_dist = plt.subplots(figsize=(10, 6))
-            sns.histplot(data=df_ml_filtered, x='edad', hue='cluster', kde=True, palette='tab10', ax=ax_cluster_dist, bins=15)
-            ax_cluster_dist.set_title('Distribución de Edad por Cluster')
-            ax_cluster_dist.set_xlabel('Edad')
-            ax_cluster_dist.set_ylabel('Frecuencia')
-            st.pyplot(fig_cluster_dist)
-            st.markdown("Este histograma superpuesto muestra cómo se distribuyen las edades dentro de cada cluster, ayudando a entender los perfiles de edad de cada grupo.")
-            # Guardar para el informe HTML
-            buf = io.BytesIO()
-            fig_cluster_dist.savefig(buf, format="png", bbox_inches="tight")
-            st.session_state['cluster_results_data']['cluster_plots_data'].append(("Distribución de Edad por Cluster", base64.b64encode(buf.getvalue()).decode()))
-            plt.close(fig_cluster_dist)
-        else:
-            st.info("La característica 'edad' no está disponible o no es numérica en los datos filtrados para visualizar la distribución por cluster.")
-
-
-        # --- NUEVA FUNCIONALIDAD: Evaluación del Clustering ---
-        st.markdown("---")
-        st.subheader("Métricas de Evaluación del Clustering")
-
-        # Comprobar si se pueden calcular las métricas (se necesitan al menos 2 clusters y más puntos que clusters)
-        if n_clusters > 1 and X_scaled_all.shape[0] >= n_clusters:
-            st.metric("Silhouette Score", f"{st.session_state['cluster_results_data']['silhouette_score']:.2f}")
-            st.markdown("""
-            El **Silhouette Score** mide cuán similar es un objeto a su propio cluster (cohesión) en comparación con otros clusters (separación).
-            - Un valor cercano a +1 indica que el objeto está bien agrupado.
-            - Un valor cercano a 0 indica que el objeto está en la frontera entre dos clusters.
-            - Un valor cercano a -1 indica que el objeto ha sido asignado al cluster incorrecto.
-            Un score alto sugiere una buena separación de los clusters.
-            """)
-
-            st.metric("Davies-Bouldin Index", f"{st.session_state['cluster_results_data']['davies_bouldin_index']:.2f}")
-            st.markdown("""
-            El **Davies-Bouldin Index** mide la similitud promedio entre cada cluster y el cluster más similar, donde la similitud es la relación entre la distancia dentro del cluster y la distancia entre clusters. Un valor más bajo indica un mejor agrupamiento.
-            """)
-
-            st.metric("Calinski-Harabasz Index", f"{st.session_state['cluster_results_data']['calinski_harabasz_index']:.2f}")
-            st.markdown("""
-            El **Calinski-Harabasz Index** (también conocido como Variance Ratio Criterion) es la relación entre la dispersión inter-cluster y la dispersión intra-cluster. Un valor más alto generalmente corresponde a modelos con clusters mejor definidos.
-            """)
-
-            st.metric("Inercia (SSE)", f"{st.session_state['cluster_results_data']['inertia']:.2f}")
-            st.markdown("""
-            La **Inercia** (Sum of Squared Errors - SSE) es la suma de las distancias cuadradas de cada punto a su centroide asignado. Un valor más bajo generalmente indica clusters más compactos.
-            """)
-        else:
-            st.info("No se pueden calcular las métricas de evaluación del clustering. Se requieren al menos 2 clusters y un número de muestras mayor o igual al número de clusters.")
-
-
-        st.markdown("### **Interpretación y Aplicaciones:**")
-        st.markdown(f"""
-        Basado en las características seleccionadas, el modelo K-Means ha identificado **{n_clusters}** grupos distintos de pacientes. La interpretación de estos grupos dependerá de los valores promedio y las distribuciones de las características dentro de cada cluster.
-
-        **Aplicaciones potenciales:**
-        * **Marketing y Comunicación Personalizada:** Enviar información relevante sobre prevención o programas de salud específicos para cada grupo de pacientes.
-        * **Gestión de Recursos Hospitalarios:** Anticipar las necesidades de ciertos grupos de pacientes (ej., especialidades pediátricas para el cluster joven, geriatría para el cluster mayor, o recursos para pacientes con ciertas condiciones).
-        * **Investigación Clínica:** Estudiar patrones de enfermedades o tratamientos que sean más prevalentes en un segmento de pacientes particular.
-        * **Recomendación de Tratamientos/Alertas:** Aunque un modelo de clasificación es más directo para esto, el clustering puede sentar las bases. Por ejemplo, si un nuevo paciente cae en un cluster específico, el sistema podría sugerir alertas de salud comunes para ese grupo o tratamientos que han demostrado ser efectivos para pacientes similares.
-        """)
+                    # Gráfico de dispersión 3D (si hay suficientes dimensiones reducidas o PCA/t-SNE)
+                    # Por simplicidad, se usa solo edad y una dummy de sexo/ciudad para el ejemplo
+                    # OJO: Para gráficos 3D más significativos, se requeriría PCA o t-SNE
+                    if len(features_df.columns) >= 2:
+                        fig_3d = px.scatter_3d(
+                            features_df,
+                            x=features_df.columns[0],
+                            y=features_df.columns[1],
+                            z='cluster', # Usar cluster como eje Z para visualización
+                            color='cluster',
+                            title='Clusters en 3D (Características Seleccionadas)',
+                            hover_data=['cluster']
+                        )
+                        cluster_plots.append(("Clusters en 3D (Características Seleccionadas)", fig_3d))
+                        st.plotly_chart(fig_3d, use_container_width=True)
+                    else:
+                        st.info("No hay suficientes características para una visualización 3D significativa.")
+                    
+                    st.session_state['cluster_results_data']['cluster_plots_data'] = cluster_plots
+                    st.success("Clustering completado y resultados generados.")
