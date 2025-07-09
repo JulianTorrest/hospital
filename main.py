@@ -11,7 +11,7 @@ from sklearn.compose import ColumnTransformer
 import io
 import base64
 import plotly.express as px
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 
 # --- Initial Configuration ---
 st.set_page_config(layout="wide", page_title="Análisis de Calidad de Datos Hospital")
@@ -68,27 +68,38 @@ def calculate_age_from_dob(row_dob, current_date):
 # Cargar datos de pacientes
 df_pacientes = load_data(DATA_URL_PACIENTES, 'pacientes')
 
-# Inicializar st.session_state para guardar los resultados entre secciones
+# --- Inicializar st.session_state para guardar los resultados entre secciones ---
+# Esto es CRÍTICO para evitar KeyErrors al acceder a variables de sesión
 if 'df_cleaned' not in st.session_state:
     st.session_state['df_cleaned'] = df_pacientes.copy() # Copia inicial
+
 if 'df_original' not in st.session_state:
     st.session_state['df_original'] = df_pacientes.copy() # Copia del original
 
-# Inicializar otras variables de sesión para el informe HTML
 if 'kpis' not in st.session_state:
     st.session_state['kpis'] = {}
+
 if 'eda_plots_data' not in st.session_state:
     st.session_state['eda_plots_data'] = [] # Lista de (title, base64_image_data)
+
 if 'cluster_results_data' not in st.session_state:
     st.session_state['cluster_results_data'] = {
+        'n_clusters': 0,
+        'silhouette_score': np.nan,
+        'davies_bouldin_index': np.nan,
+        'calinski_harabasz_index': np.nan,
+        'inertia': np.nan,
         'cluster_centers_df': pd.DataFrame(),
         'cluster_counts_df': pd.DataFrame(),
         'cluster_plots_data': [] # Lista de (title, base64_image_data)
     }
+
 if 'df_nulos_comp' not in st.session_state:
     st.session_state['df_nulos_comp'] = pd.DataFrame()
+
 if 'indicators_original' not in st.session_state:
     st.session_state['indicators_original'] = {}
+
 if 'indicators_cleaned' not in st.session_state:
     st.session_state['indicators_cleaned'] = {}
 
@@ -199,7 +210,8 @@ elif selected_section == "2. Limpieza y Validación":
     st.header("2. 🧹 Limpieza y Validación")
     st.markdown("Aplicación de un proceso de limpieza para resolver los problemas identificados y validaciones cruzadas.")
 
-    df_cleaned = st.session_state['df_original'].copy() # Trabajar en una copia del original para empezar la limpieza
+    # Siempre empezar con una copia del original para la limpieza de esta sesión
+    df_cleaned = st.session_state['df_original'].copy()
     current_date = date.today() # Definir la fecha actual una vez
 
     # --- Limpieza de Datos ---
@@ -231,7 +243,7 @@ df_cleaned.loc[df_cleaned['sexo'].isna(), 'sexo'] = None
         'male': 'Male'
     }
     df_cleaned['sexo'] = df_cleaned['sexo'].map(sex_mapping) # Genera np.nan para no mapeados
-    
+
     # Rellenar np.nan (si los hay) con Python None
     df_cleaned.loc[df_cleaned['sexo'].isna(), 'sexo'] = None
 
@@ -372,7 +384,7 @@ df_cleaned.loc[df_cleaned['telefono'].str.strip() == '', 'telefono'] = None
     st.markdown("Identifica y opcionalmente maneja los valores atípicos en columnas numéricas.")
 
     numeric_cols_for_outliers = df_cleaned.select_dtypes(include=np.number).columns.tolist()
-    
+
     outlier_col = st.selectbox(
         "Selecciona una columna numérica para detectar outliers:",
         numeric_cols_for_outliers,
@@ -439,7 +451,7 @@ df_cleaned.loc[df_cleaned['telefono'].str.strip() == '', 'telefono'] = None
         st.dataframe(cols_below_threshold)
     else:
         st.success(f"Todas las columnas cumplen con el umbral de {completeness_threshold}% de completitud.")
-    
+
     # --- NUEVA FUNCIONALIDAD: Validación de Rangos Numéricos ---
     st.subheader("2.7. Validación de Rangos Numéricos")
     st.markdown("Verifica si los valores de una columna numérica están dentro de un rango aceptable.")
@@ -492,8 +504,10 @@ elif selected_section == "3. Indicadores y Documentación":
     st.header("3. 📈 Indicadores de Calidad y Documentación")
     st.markdown("Resumen de indicadores de calidad antes y después de la limpieza, junto con la documentación.")
 
-    if 'df_cleaned' not in st.session_state or 'df_original' not in st.session_state:
+    # Asegurarse de que los DataFrames estén disponibles
+    if 'df_cleaned' not in st.session_state or st.session_state['df_cleaned'].empty or 'df_original' not in st.session_state or st.session_state['df_original'].empty:
         st.warning("Por favor, navega primero a la sección 'Limpieza y Validación' para generar los datos limpios y el estado de la sesión.")
+        st.stop()
     else:
         df_original = st.session_state['df_original']
         df_cleaned = st.session_state['df_cleaned']
@@ -625,7 +639,7 @@ elif selected_section == "3. Indicadores y Documentación":
         # Deberías tener tus funciones de limpieza y validación en un módulo separado para importarlas aquí.
         import pandas as pd
         import pytest
-        from datetime import date
+        from datetime import date, datetime
         # from your_project.data_quality_functions import clean_patient_data, calculate_age_from_dob # Ejemplo de importación
 
         # Asegúrate de que calculate_age_from_dob sea accesible si no la importas desde un módulo
@@ -858,7 +872,14 @@ elif selected_section == "3. Indicadores y Documentación":
                         {cluster_counts_html}
                         <h3>3.3. Visualización de Clusters</h3>
                         {cluster_plots_html}
-                        <h4>Silhouette Score: {silhouette_score_value:.2f}</h4>
+                        <h4>Métricas de Evaluación del Clustering:</h4>
+                        <ul>
+                            <li><strong>Número de Clusters:</strong> {n_clusters_value}</li>
+                            <li><strong>Silhouette Score:</strong> {silhouette_score_value:.2f}</li>
+                            <li><strong>Davies-Bouldin Index:</strong> {davies_bouldin_index_value:.2f}</li>
+                            <li><strong>Calinski-Harabasz Index:</strong> {calinski_harabasz_index_value:.2f}</li>
+                            <li><strong>Inercia (SSE):</strong> {inertia_value:.2f}</li>
+                        </ul>
                     </div>
 
                 </body>
@@ -879,7 +900,11 @@ elif selected_section == "3. Indicadores y Documentación":
                     cluster_centers_html=cluster_results['cluster_centers_df'].to_html(index=True) if not cluster_results['cluster_centers_df'].empty else "<p>No hay datos de centros de cluster.</p>",
                     cluster_counts_html=cluster_results['cluster_counts_df'].to_html(index=True) if not cluster_results['cluster_counts_df'].empty else "<p>No hay datos de conteo por cluster.</p>",
                     cluster_plots_html="".join([f'<div class="plot-container"><h4>{title}</h4><img src="data:image/png;base64,{img_data}" /></div>' for title, img_data in cluster_results['cluster_plots_data']]),
-                    silhouette_score_value=cluster_results.get('silhouette_score', np.nan)
+                    n_clusters_value=cluster_results.get('n_clusters', 'N/A'),
+                    silhouette_score_value=cluster_results.get('silhouette_score', np.nan),
+                    davies_bouldin_index_value=cluster_results.get('davies_bouldin_index', np.nan),
+                    calinski_harabasz_index_value=cluster_results.get('calinski_harabasz_index', np.nan),
+                    inertia_value=cluster_results.get('inertia', np.nan)
                 )
                 return html_content
 
@@ -954,7 +979,7 @@ elif selected_section == "4. EDA Avanzado & Dashboards":
             st.metric("Edad Promedio (Filtrada)", f"{avg_age:.1f}" if not pd.isna(avg_age) else "N/A")
         with kpi3:
             st.metric("Ciudad Más Común", most_common_city)
-        
+
         st.session_state['kpis'] = { # Guardar KPIs para el informe
             'num_patients': num_patients,
             'avg_age': avg_age,
@@ -1025,7 +1050,7 @@ elif selected_section == "4. EDA Avanzado & Dashboards":
             st.markdown("#### Edad Promedio por Ciudad y Género")
             if not df_display[['ciudad', 'sexo', 'edad']].dropna().empty:
                 avg_age_city_sex = df_display.groupby(['ciudad', 'sexo'])['edad'].mean().unstack()
-                
+
                 # Ensure numerical type and replace any non-numeric with NaN
                 avg_age_city_sex = avg_age_city_sex.astype(float).fillna(np.nan)
 
@@ -1090,11 +1115,11 @@ elif selected_section == "4. EDA Avanzado & Dashboards":
             if 'tipo_sangre' not in df_display.columns:
                 blood_types = ['O+', 'A+', 'B+', 'AB+', 'O-', 'A-', 'B-', 'AB-']
                 df_display['tipo_sangre'] = np.random.choice(blood_types, size=len(df_display))
-            
+
             # Filtra columnas categóricas, excluyendo 'ciudad' y 'sexo' que ya se grafican, y las de identificadores
             other_categorical_cols = [
                 col for col in df_display.select_dtypes(include='object').columns
-                if col not in ['ciudad', 'sexo', 'nombre', 'email', 'telefono'] 
+                if col not in ['ciudad', 'sexo', 'nombre', 'email', 'telefono']
             ]
 
             if other_categorical_cols:
@@ -1168,8 +1193,7 @@ elif selected_section == "5. Modelado de Machine Learning":
 
         st.subheader("Preparación de Datos para ML y Selección de Características")
 
-        # --- Simular más características si no existen ---
-        # Asegúrate de que estas columnas existan para que el selectbox funcione
+        # --- Simular más características si no existen (asegurando que existan para el selectbox) ---
         if 'tipo_sangre' not in df_ml.columns:
             blood_types = ['O+', 'A+', 'B+', 'AB+', 'O-', 'A-', 'B-', 'AB-']
             df_ml['tipo_sangre'] = np.random.choice(blood_types, size=len(df_ml))
@@ -1177,19 +1201,18 @@ elif selected_section == "5. Modelado de Machine Learning":
             df_ml['presion_arterial_sistolica'] = np.random.randint(90, 180, size=len(df_ml))
         if 'presion_arterial_diastolica' not in df_ml.columns:
             df_ml['presion_arterial_diastolica'] = np.random.randint(60, 120, size=len(df_ml))
+        # También asegúrate de que 'edad' es numérica para el ML
+        df_ml['edad'] = pd.to_numeric(df_ml['edad'], errors='coerce')
         # --- Fin de simulación ---
 
-        # Convertir 'edad' a flotante para asegurar compatibilidad con escalado
-        df_ml['edad'] = df_ml['edad'].astype(float)
-
-        # Filtrar columnas disponibles para ML (excluyendo identificadores y columnas que ya no usaremos)
+        # Filtrar columnas disponibles para ML (excluyendo identificadores y columnas que ya no usaremos para ML)
         available_features = [col for col in df_ml.columns if col not in ['id_paciente', 'nombre', 'email', 'telefono', 'fecha_nacimiento', 'mes_registro']]
-        
+
         # Permitir al usuario seleccionar las características
         selected_features = st.multiselect(
             "Selecciona las características para el clustering:",
             available_features,
-            default=['edad', 'sexo', 'ciudad', 'tipo_sangre', 'presion_arterial_sistolica', 'presion_arterial_diastolica'], # Valores por defecto
+            default=[f for f in ['edad', 'sexo', 'ciudad', 'tipo_sangre', 'presion_arterial_sistolica', 'presion_arterial_diastolica'] if f in available_features], # Valores por defecto, verificando existencia
             key="ml_features_select"
         )
 
@@ -1197,27 +1220,33 @@ elif selected_section == "5. Modelado de Machine Learning":
             st.warning("Por favor, selecciona al menos una característica para el clustering.")
             st.stop()
 
-        # Identificar características numéricas y categóricas seleccionadas
-        numeric_features = [f for f in selected_features if f in df_ml.select_dtypes(include=np.number).columns]
-        categorical_features = [f for f in selected_features if f in df_ml.select_dtypes(include='object').columns]
+        # Manejo de nulos en las características seleccionadas: dropear filas con nulos
+        df_ml_filtered = df_ml[selected_features].dropna()
 
-        # Manejo de nulos ANTES de la codificación y escalado (importante para Pipeline)
-        df_ml_filtered = df_ml[selected_features].dropna() # Dropear filas con nulos en las características seleccionadas
-        
         if df_ml_filtered.empty:
             st.warning("No hay suficientes datos limpios y completos con las características seleccionadas para realizar el clustering.")
             st.stop()
 
+        # Identificar características numéricas y categóricas dentro de las seleccionadas y filtradas
+        numeric_features = [f for f in selected_features if pd.api.types.is_numeric_dtype(df_ml_filtered[f])]
+        categorical_features = [f for f in selected_features if pd.api.types.is_object_dtype(df_ml_filtered[f]) or pd.api.types.is_string_dtype(df_ml_filtered[f])]
+
+        if not numeric_features and not categorical_features:
+            st.warning("Las características seleccionadas no son ni numéricas ni categóricas válidas para el preprocesamiento. Por favor, revisa tu selección.")
+            st.stop()
+
         # Crear un preprocesador usando ColumnTransformer
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ('num', StandardScaler(), numeric_features),
-                ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
-            ])
+        transformers = []
+        if numeric_features:
+            transformers.append(('num', StandardScaler(), numeric_features))
+        if categorical_features:
+            transformers.append(('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features))
+
+        preprocessor = ColumnTransformer(transformers, remainder='passthrough')
 
         # Ajustar y transformar los datos
         X_scaled_all = preprocessor.fit_transform(df_ml_filtered)
-        
+
         st.write("Datos preprocesados y escalados para el modelo de clustering (dimensiones):", X_scaled_all.shape)
         st.markdown("**Justificación:** Las características numéricas se escalan para igualar su contribución. Las categóricas se convierten a formato numérico (One-Hot Encoding) para que el algoritmo K-Means pueda procesarlas.")
 
@@ -1226,61 +1255,110 @@ elif selected_section == "5. Modelado de Machine Learning":
         # --- Implementación Manual del Método del Codo ---
         sse = [] # Suma de Errores Cuadrados (o Inercia)
         # Prueba un rango de K de 1 a 10 (o ajusta según sea necesario)
-        k_range = range(1, min(11, X_scaled_all.shape[0])) # Evitar k mayor que el número de muestras
+        # Asegurarse de que k_range no exceda el número de muestras o 10
+        k_range_limit = min(11, X_scaled_all.shape[0])
+        k_range = range(1, k_range_limit)
 
-        with st.spinner("Calculando el Método del Codo..."):
-            for k in k_range:
-                try:
-                    kmeans_model = KMeans(n_clusters=k, random_state=42, n_init='auto')
-                    kmeans_model.fit(X_scaled_all)
-                    sse.append(kmeans_model.inertia_)
-                except ValueError as e:
-                    st.error(f"Error al calcular la inercia para k={k}: {e}")
-                    sse.append(None) # Añadir None si ocurre un error
+        if k_range_limit <= 1:
+            st.info("Se necesitan al menos 2 puntos para realizar el método del codo.")
+        else:
+            with st.spinner("Calculando el Método del Codo..."):
+                for k in k_range:
+                    try:
+                        kmeans_model = KMeans(n_clusters=k, random_state=42, n_init='auto')
+                        kmeans_model.fit(X_scaled_all)
+                        sse.append(kmeans_model.inertia_)
+                    except ValueError as e:
+                        st.error(f"Error al calcular la inercia para k={k}: {e}")
+                        sse.append(np.nan) # Añadir nan si ocurre un error
 
-        # Graficar el Método del Codo
-        fig_elbow, ax_elbow = plt.subplots(figsize=(10, 6))
-        ax_elbow.plot(k_range, sse, marker='o', linestyle='--')
-        ax_elbow.set_title('Método del Codo para K-Means')
-        ax_elbow.set_xlabel('Número de Clusters (k)')
-        ax_elbow.set_ylabel('Inercia (SSE)')
-        ax_elbow.grid(True)
-        st.pyplot(fig_elbow)
-        st.markdown("""
-        El **Método del Codo** ayuda a determinar el número óptimo de clusters (`k`). Se busca el punto en el gráfico donde la inercia (suma de cuadrados dentro del cluster) disminuye significativamente, formando una "rodilla" o "codo".
-        """)
+            if any(pd.notna(s) for s in sse): # Solo graficar si hay valores válidos
+                fig_elbow, ax_elbow = plt.subplots(figsize=(10, 6))
+                ax_elbow.plot(k_range, sse, marker='o', linestyle='--')
+                ax_elbow.set_title('Método del Codo para K-Means')
+                ax_elbow.set_xlabel('Número de Clusters (k)')
+                ax_elbow.set_ylabel('Inercia (SSE)')
+                ax_elbow.grid(True)
+                st.pyplot(fig_elbow)
+                plt.close(fig_elbow) # Cerrar figura para liberar memoria
+                st.markdown("""
+                El **Método del Codo** ayuda a determinar el número óptimo de clusters (`k`). Se busca el punto en el gráfico donde la inercia (suma de cuadrados dentro del cluster) disminuye significativamente, formando una "rodilla" o "codo".
+                """)
+            else:
+                st.info("No se pudo generar el gráfico del Método del Codo debido a datos insuficientes o errores en el cálculo.")
         # --- Fin de la Implementación Manual del Método del Codo ---
+
 
         # Slider para que el usuario elija el número de clusters
         st.subheader("Configuración del Modelo K-Means")
-        n_clusters_max = min(8, X_scaled_all.shape[0] - 1 if X_scaled_all.shape[0] > 1 else 1) # Asegurarse de que no haya más clusters que puntos-1
-        n_clusters = st.slider("Selecciona el número de clusters (k):", min_value=2, max_value=n_clusters_max, value=min(3, n_clusters_max), key="n_clusters_slider")
+        # Asegurarse de que el número máximo de clusters sea válido
+        n_clusters_max_slider = min(8, X_scaled_all.shape[0] - 1 if X_scaled_all.shape[0] > 1 else 1)
+        if n_clusters_max_slider < 2:
+            st.warning("No hay suficientes datos para formar al menos 2 clusters. Asegúrate de tener suficientes registros después del filtrado.")
+            st.stop()
+        n_clusters = st.slider("Selecciona el número de clusters (k):", min_value=2, max_value=n_clusters_max_slider, value=min(3, n_clusters_max_slider), key="n_clusters_slider")
 
         # Entrenamiento del modelo
         with st.spinner(f"Entrenando modelo K-Means con {n_clusters} clusters..."):
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
-            df_ml_filtered['cluster'] = kmeans.fit_predict(X_scaled_all)
-            st.success(f"Modelo K-Means entrenado con **{n_clusters}** clusters.")
+            try:
+                kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
+                df_ml_filtered['cluster'] = kmeans.fit_predict(X_scaled_all)
+                st.success(f"Modelo K-Means entrenado con **{n_clusters}** clusters.")
+
+                # Calcular métricas de evaluación
+                sil_score = silhouette_score(X_scaled_all, df_ml_filtered['cluster'])
+                db_score = davies_bouldin_score(X_scaled_all, df_ml_filtered['cluster'])
+                ch_score = calinski_harabasz_score(X_scaled_all, df_ml_filtered['cluster'])
+                inertia_val = kmeans.inertia_
+
+                # Guardar métricas en session_state para el informe
+                st.session_state['cluster_results_data']['n_clusters'] = n_clusters
+                st.session_state['cluster_results_data']['silhouette_score'] = sil_score
+                st.session_state['cluster_results_data']['davies_bouldin_index'] = db_score
+                st.session_state['cluster_results_data']['calinski_harabasz_index'] = ch_score
+                st.session_state['cluster_results_data']['inertia'] = inertia_val
+
+            except Exception as e:
+                st.error(f"Error al entrenar el modelo K-Means: {e}")
+                st.stop() # Detener la ejecución si el entrenamiento falla
 
         st.subheader("Resultados del Agrupamiento")
 
         # Limpiar resultados de cluster para el informe en cada ejecución
-        st.session_state['cluster_results_data'] = {
-            'cluster_centers_df': pd.DataFrame(),
-            'cluster_counts_df': pd.DataFrame(),
-            'cluster_plots_data': [],
-            'silhouette_score': np.nan
-        }
+        st.session_state['cluster_results_data']['cluster_plots_data'] = []
 
         # Características promedio por cluster (en escala original para numéricas, y distribuciones para categóricas)
         st.markdown("#### Características Promedio por Cluster (en escala original para numéricas)")
-        
-        # Para características numéricas
-        cluster_centers_original_num = scaler.inverse_transform(kmeans.cluster_centers_[:, :len(numeric_features)])
-        cluster_df_num = pd.DataFrame(cluster_centers_original_num, columns=numeric_features)
-        cluster_df_num['Cluster'] = range(n_clusters)
-        st.dataframe(cluster_df_num.set_index('Cluster'))
-        
+
+        # Invertir la transformación solo para las características numéricas originales
+        # Necesitamos el OneHotEncoder para saber los nombres de las columnas categóricas después de la transformación
+        # para que StandardScaler.inverse_transform trabaje correctamente en el subconjunto numérico.
+        # Una forma más robusta es obtener los nombres de las columnas transformadas:
+        ohe_feature_names = preprocessor.named_transformers_['cat'].get_feature_names_out(categorical_features).tolist()
+        all_transformed_features = numeric_features + ohe_feature_names
+
+        # Reconstruir un DataFrame para facilitar la interpretación de los centros de cluster
+        # Esto es un poco más complejo porque KMeans.cluster_centers_ está en el espacio transformado.
+        # Para interpretar los centros en la escala original, necesitamos aplicar la inversa de StandardScaler.
+        # Para categóricas, no hay una 'inversa' directa, se interpreta por la proporción de 1s.
+
+        # Desescalar los centros para las características numéricas
+        if numeric_features:
+            scaler = preprocessor.named_transformers_['num']
+            # Obtener solo las columnas numéricas de los centros
+            # Esto asume que las columnas numéricas están al principio de X_scaled_all
+            cluster_centers_scaled_num = kmeans.cluster_centers_[:, :len(numeric_features)]
+            cluster_centers_original_num = scaler.inverse_transform(cluster_centers_scaled_num)
+            cluster_df_num = pd.DataFrame(cluster_centers_original_num, columns=numeric_features)
+            cluster_df_num['Cluster'] = range(n_clusters)
+            st.dataframe(cluster_df_num.set_index('Cluster'))
+        else:
+            st.info("No hay características numéricas seleccionadas para mostrar promedios por cluster.")
+
+        # Guardar para el informe HTML
+        st.session_state['cluster_results_data']['cluster_centers_df'] = cluster_df_num if 'cluster_df_num' in locals() else pd.DataFrame()
+
+
         # Para características categóricas
         if categorical_features:
             st.markdown("#### Distribución de Características Categóricas por Cluster")
@@ -1288,11 +1366,8 @@ elif selected_section == "5. Modelado de Machine Learning":
                 st.write(f"**Distribución de '{cat_feat}' por Cluster:**")
                 cat_dist = df_ml_filtered.groupby('cluster')[cat_feat].value_counts(normalize=True).unstack(fill_value=0)
                 st.dataframe(cat_dist.style.format("{:.2%}")) # Formato porcentaje
-                
+
         st.markdown("Estos valores representan el centro de cada cluster para características numéricas y la distribución de categorías para las categóricas, ayudando a interpretar lo que define a cada grupo de pacientes.")
-        
-        # Guardar para el informe HTML
-        st.session_state['cluster_results_data']['cluster_centers_df'] = cluster_df_num
 
 
         # Conteo de pacientes por cluster
@@ -1314,28 +1389,33 @@ elif selected_section == "5. Modelado de Machine Learning":
         st.session_state['cluster_results_data']['cluster_counts_df'] = cluster_counts.to_frame(name='Conteo')
 
 
-        # Visualización de los clusters (si solo tenemos una característica como 'edad' o una selección específica)
-        st.markdown("#### Visualización de Clusters (Distribución de Edad por Cluster)")
-        fig_cluster_dist, ax_cluster_dist = plt.subplots(figsize=(10, 6))
-        sns.histplot(data=df_ml_filtered, x='edad', hue='cluster', kde=True, palette='tab10', ax=ax_cluster_dist, bins=15)
-        ax_cluster_dist.set_title('Distribución de Edad por Cluster')
-        ax_cluster_dist.set_xlabel('Edad')
-        ax_cluster_dist.set_ylabel('Frecuencia')
-        st.pyplot(fig_cluster_dist)
-        st.markdown("Este histograma superpuesto muestra cómo se distribuyen las edades dentro de cada cluster, ayudando a entender los perfiles de edad de cada grupo.")
-        # Guardar para el informe HTML
-        buf = io.BytesIO()
-        fig_cluster_dist.savefig(buf, format="png", bbox_inches="tight")
-        st.session_state['cluster_results_data']['cluster_plots_data'].append(("Distribución de Edad por Cluster", base64.b64encode(buf.getvalue()).decode()))
-        plt.close(fig_cluster_dist)
+        # Visualización de los clusters (Distribución de Edad por Cluster)
+        # Asegurarse de que 'edad' esté en el df_ml_filtered y sea numérica
+        if 'edad' in df_ml_filtered.columns and pd.api.types.is_numeric_dtype(df_ml_filtered['edad']):
+            st.markdown("#### Visualización de Clusters (Distribución de Edad por Cluster)")
+            fig_cluster_dist, ax_cluster_dist = plt.subplots(figsize=(10, 6))
+            sns.histplot(data=df_ml_filtered, x='edad', hue='cluster', kde=True, palette='tab10', ax=ax_cluster_dist, bins=15)
+            ax_cluster_dist.set_title('Distribución de Edad por Cluster')
+            ax_cluster_dist.set_xlabel('Edad')
+            ax_cluster_dist.set_ylabel('Frecuencia')
+            st.pyplot(fig_cluster_dist)
+            st.markdown("Este histograma superpuesto muestra cómo se distribuyen las edades dentro de cada cluster, ayudando a entender los perfiles de edad de cada grupo.")
+            # Guardar para el informe HTML
+            buf = io.BytesIO()
+            fig_cluster_dist.savefig(buf, format="png", bbox_inches="tight")
+            st.session_state['cluster_results_data']['cluster_plots_data'].append(("Distribución de Edad por Cluster", base64.b64encode(buf.getvalue()).decode()))
+            plt.close(fig_cluster_dist)
+        else:
+            st.info("La característica 'edad' no está disponible o no es numérica en los datos filtrados para visualizar la distribución por cluster.")
+
 
         # --- NUEVA FUNCIONALIDAD: Evaluación del Clustering ---
         st.markdown("---")
         st.subheader("Métricas de Evaluación del Clustering")
 
-        if n_clusters > 1 and X_scaled_all.shape[0] > n_clusters: # Silhouette score requiere al menos 2 clusters y más puntos que clusters
-            silhouette_avg = silhouette_score(X_scaled_all, df_ml_filtered['cluster'])
-            st.metric("Silhouette Score", f"{silhouette_avg:.2f}")
+        # Comprobar si se pueden calcular las métricas (se necesitan al menos 2 clusters y más puntos que clusters)
+        if n_clusters > 1 and X_scaled_all.shape[0] >= n_clusters:
+            st.metric("Silhouette Score", f"{st.session_state['cluster_results_data']['silhouette_score']:.2f}")
             st.markdown("""
             El **Silhouette Score** mide cuán similar es un objeto a su propio cluster (cohesión) en comparación con otros clusters (separación).
             - Un valor cercano a +1 indica que el objeto está bien agrupado.
@@ -1343,9 +1423,23 @@ elif selected_section == "5. Modelado de Machine Learning":
             - Un valor cercano a -1 indica que el objeto ha sido asignado al cluster incorrecto.
             Un score alto sugiere una buena separación de los clusters.
             """)
-            st.session_state['cluster_results_data']['silhouette_score'] = silhouette_avg
+
+            st.metric("Davies-Bouldin Index", f"{st.session_state['cluster_results_data']['davies_bouldin_index']:.2f}")
+            st.markdown("""
+            El **Davies-Bouldin Index** mide la similitud promedio entre cada cluster y el cluster más similar, donde la similitud es la relación entre la distancia dentro del cluster y la distancia entre clusters. Un valor más bajo indica un mejor agrupamiento.
+            """)
+
+            st.metric("Calinski-Harabasz Index", f"{st.session_state['cluster_results_data']['calinski_harabasz_index']:.2f}")
+            st.markdown("""
+            El **Calinski-Harabasz Index** (también conocido como Variance Ratio Criterion) es la relación entre la dispersión inter-cluster y la dispersión intra-cluster. Un valor más alto generalmente corresponde a modelos con clusters mejor definidos.
+            """)
+
+            st.metric("Inercia (SSE)", f"{st.session_state['cluster_results_data']['inertia']:.2f}")
+            st.markdown("""
+            La **Inercia** (Sum of Squared Errors - SSE) es la suma de las distancias cuadradas de cada punto a su centroide asignado. Un valor más bajo generalmente indica clusters más compactos.
+            """)
         else:
-            st.info("El Silhouette Score requiere al menos 2 clusters y más puntos que clusters para su cálculo.")
+            st.info("No se pueden calcular las métricas de evaluación del clustering. Se requieren al menos 2 clusters y un número de muestras mayor o igual al número de clusters.")
 
 
         st.markdown("### **Interpretación y Aplicaciones:**")
